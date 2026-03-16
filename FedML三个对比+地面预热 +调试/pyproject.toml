@@ -1,0 +1,124 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fedml-satellite"
+version = "1.0.0"
+description = "Ground-Assisted LEO Satellite FL (FedMeta / FO-MAML + APSKD with Warm Start)"
+license = "Apache-2.0"
+dependencies = [
+    "flwr[simulation]>=1.24.0",
+    "flwr-datasets[vision]>=0.5.0",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "matplotlib>=3.7.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["fedml"]
+
+[tool.flwr.app]
+publisher = "flwrlabs"
+
+[tool.flwr.app.components]
+serverapp = "fedml.server:app"
+clientapp = "fedml.client:app"
+
+[tool.flwr.app.config]
+# ============================================================
+# 1. FL 基础训练配置 (恢复至 200 轮)
+# ============================================================
+num-server-rounds = 50
+fraction-evaluate = 1.0
+batch-size = 32
+learning-rate = 0.01
+
+# ============================================================
+# 2. FO-MAML / 本地训练参数
+# ============================================================
+fomaml-alpha = 0.01
+fomaml-beta = 0.01
+fomaml-inner-steps = 1   
+apskd-epochs = 1         
+apskd-lr = 0.01
+
+# 匹配 200 轮的总长度，将预热期设为 50 轮
+kd-warmup-rounds = 10     
+
+# ============================================================
+# 3. Meta-Testing (元评估) 参数
+# ============================================================
+meta-adapt-steps = 10
+meta-adapt-lr = 0.01
+
+# ============================================================
+# 4. 双向知识蒸馏配置 (与 fedavg 完全对齐)
+# ============================================================
+kd-enable = true
+kd-alpha = 0.5
+kd-temperature = 2.0     
+kd-batch-size = 64
+kd-cal-samples = 2048
+kd-global-samples = 4096
+kd-forward-epochs = 1
+kd-forward-lr = 0.05
+kd-reverse-epochs = 1
+# E3 对照开关：是否执行 reverse distillation（student->teacher）
+kd-reverse-enable = true
+# E3 对照开关：reverse distill 时冻结 teacher 的 BatchNorm running stats
+kd-reverse-freeze-bn = true
+kd-reverse-lr = 0.01
+
+# ============================================================
+# 5. 物理层通信链路参数
+# ============================================================
+sigma2 = 1e-9
+default-distance-km = 780.0
+default-tau-d-s = 50000.0   
+
+w-u-hz = 4000000.0
+w-d-hz = 4000000.0
+p-u-w = 100.0
+p-d-w = 100.0
+f-c-hz = 20000000000.0
+A-T = 60.0
+A-R = 30.0
+G-H = 0.8
+delta = 2.0             
+psi-db-per-km = 0.5     
+zeta-km = 500.0         
+
+# 距离随机化方案
+distance-km-min = 300.0
+distance-km-max = 1000.0
+distance-seed = 2026
+
+# ============================================================
+# 6. FedMeta 策略与成员管理参数
+# ============================================================
+selection-mode = "window"   
+ks-train = 6                
+ks-eval = 3                 
+enforce-comm = true         
+
+turnover-T = 5
+deltaQ = 2                  
+deltaP = 3                  
+probe-blocked-k = 1         
+
+# ============================================================
+# 7. Client local training mode
+# ============================================================
+client-train-mode = "fomaml+apskd"   
+
+[tool.flwr.federations]
+default = "local-simulation"
+
+[tool.flwr.federations.local-simulation]
+options.num-supernodes = 5
+
+[tool.flwr.federations.local-simulation-gpu]
+options.num-supernodes = 5
+options.backend.client-resources.num-cpus = 2
+options.backend.client-resources.num-gpus = 0.2

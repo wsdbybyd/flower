@@ -1,0 +1,118 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fedavg-apskd"
+version = "1.0.0"
+description = "Ground-Assisted LEO Satellite FL (APSKD + Dual Distillation)"
+license = "Apache-2.0"
+dependencies = [
+    "flwr[simulation]>=1.24.0",
+    "flwr-datasets[vision]>=0.5.0",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.flwr.app]
+publisher = "flwrlabs"
+
+[tool.flwr.app.components]
+serverapp = "fedavg.server:app"
+clientapp = "fedavg.client:app"
+
+[tool.flwr.app.config]
+# ============================================================
+# 1. FL 基础训练配置
+# ============================================================
+num-server-rounds = 10       # 增加轮数以便观察收敛
+fraction-evaluate = 1.0      # 评估所有节点
+local-epochs = 5             # 增加本地轮数，让自蒸馏(APSKD)有足够迭代空间
+learning-rate = 0.01         # 卫星端 Student 模型的学习率
+batch-size = 32
+
+# ============================================================
+# 2. 卫星端 APSKD (自适应渐进式自蒸馏) 参数
+# ============================================================
+# 对应论文 Eq. 4: a_t 线性增长的终值 a_T
+# 范围通常在 0.1 ~ 1.0 之间，控制历史模型(Teacher)的影响力
+apskd-a-T = 0.5
+
+# ============================================================
+# 3. 地面站双向蒸馏参数 (Server-Side)
+# ============================================================
+# 地面站持有的大模型 (Teacher) 的学习率 (用于反向蒸馏更新)
+server-teacher-lr = 0.001
+
+# 每次 Global Round 开始前，地面站进行 Teacher -> Student 蒸馏的步数
+gs-distill-epochs = 1
+
+# 对应论文 Eq. 2: 地面站蒸馏的平衡系数 alpha
+# alpha * CE_Loss + (1-alpha) * KL_Loss
+gs-distill-alpha = 0.5
+
+# 对应论文 Eq. 2: 蒸馏温度
+# 温度越高，Softmax 分布越平滑，包含更多"暗知识"
+gs-distill-temp = 3.0
+
+# ============================================================
+# 4. 物理层通信链路参数 (用于模拟 LEO 环境)
+# ============================================================
+sigma2 = 1e-9
+default-distance-km = 780.0
+default-tau-d-s = 50000.0   # 连接窗口时间阈值
+
+# 上下行带宽 (Hz)
+w-u-hz = 4000000.0
+w-d-hz = 4000000.0
+
+# 上下行功率 (Watts)
+p-u-w = 100.0
+p-d-w = 100.0
+
+# 载波频率 (20 GHz)
+f-c-hz = 20000000000.0
+
+# 天线增益与损耗参数
+A-T = 60.0
+A-R = 30.0
+G-H = 0.8
+delta = 2.0             # 瑞利/莱斯衰落因子
+psi-db-per-km = 0.5     # 大气衰减系数
+zeta-km = 500.0         # 衰减尺度
+
+# ============================================================
+# 5. 距离随机化方案 (每个 Client 启动时生成)
+# ============================================================
+distance-km-min = 300.0
+distance-km-max = 1000.0
+distance-seed = 2026
+
+# ============================================================
+# 6. FedAvg 策略与成员管理参数
+# ============================================================
+selection-mode = "window"   # 使用基于窗口余量的节点选择策略
+ks-train = 3                # 每轮用于训练的最小节点数
+ks-eval = 3                 # 每轮用于评估的最小节点数
+enforce-comm = true         # 强制过滤掉通信不可行(超时)的节点
+
+# 成员动态进出管理 (Turnover)
+turnover-T = 5
+deltaQ = 2                  # 连续成功多少次加入网络
+deltaP = 3                  # 连续失败多少次剔除网络
+probe-blocked-k = 1         # 每轮尝试探测多少个被屏蔽的节点
+
+[tool.flwr.federations]
+default = "local-simulation"
+
+[tool.flwr.federations.local-simulation]
+# 模拟的总节点数 (SuperNodes)
+options.num-supernodes = 5
+
+[tool.flwr.federations.local-simulation-gpu]
+options.num-supernodes = 5
+options.backend.client-resources.num-cpus = 2
+options.backend.client-resources.num-gpus = 0.2

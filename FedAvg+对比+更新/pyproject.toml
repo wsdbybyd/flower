@@ -1,0 +1,93 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "test"
+version = "1.0.0"
+description = "Federated Learning with Ground Distillation, clean FedAvg baseline, and link simulation"
+license = "Apache-2.0"
+dependencies = [
+    "flwr[simulation]>=1.24.0",
+    "flwr-datasets[vision]>=0.5.0",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "matplotlib",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.flwr.app]
+publisher = "flwrlabs"
+
+[tool.flwr.app.components]
+serverapp = "fedavg.server:app"
+clientapp = "fedavg.client:app"
+
+[tool.flwr.app.config]
+# ---------- FL 基本配置 ----------
+num-server-rounds = 50
+fraction-evaluate = 1.0
+local-epochs = 1
+learning-rate = 0.01
+batch-size = 32
+
+# ---------- 项目二三模式相关配置 ----------
+# Baseline / Only Ground 会显式使用 clean FedAvg
+# Dual Distill 会使用 APSKD
+apskd-a-T = 0.5
+local-train-mode = "fedavg"
+
+# ---------- 服务端双向蒸馏/地面蒸馏配置 ----------
+# 这些键名与当前 server.py / fedavg.py 保持一致
+server-teacher-lr = 0.001
+gs-distill-epochs = 1
+gs-distill-alpha = 0.5
+gs-distill-temp = 3.0
+
+# ---------- 通信/链路默认参数（server 下发给 client） ----------
+sigma2 = 1e-9
+default-distance-km = 780.0
+default-tau-d-s = 50000.0
+w-u-hz = 4000000.0
+w-d-hz = 4000000.0
+p-u-w = 100.0
+p-d-w = 100.0
+f-c-hz = 20000000000.0
+A-T = 60
+A-R = 30
+G-H = 0.8
+delta = 2
+psi-db-per-km = 0.5
+zeta-km = 500.0
+
+# ---------- 每个节点启动时随机一次距离（固定） ----------
+distance-km-min = 300.0
+distance-km-max = 1000.0
+distance-seed = 2026
+
+# ---------- 服务器侧 FedAvg / 调度参数 ----------
+selection-mode = "window"   # "random" 或 "window"
+ks-train = 6
+ks-eval = 3
+enforce-comm = true
+turnover-T = 5
+deltaQ = 2
+deltaP = 3
+probe-blocked-k = 1
+
+[tool.flwr.federations]
+default = "local-simulation"
+
+[tool.flwr.federations.local-simulation]
+options.num-supernodes = 5
+
+[tool.flwr.federations.local-simulation-gpu]
+options.num-supernodes = 5
+options.backend.client-resources.num-cpus = 2
+options.backend.client-resources.num-gpus = 0.2
+
+[tool.flwr.federations.supergrid-deployment]
+address = "supergrid.flower.ai"
+enable-account-auth = true

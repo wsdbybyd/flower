@@ -1,0 +1,123 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fedml-satellite"
+version = "1.0.0"
+description = "Ground-Assisted LEO Satellite FL (FedMeta / FO-MAML + APSKD)"
+license = "Apache-2.0"
+dependencies = [
+    "flwr[simulation]>=1.24.0",
+    "flwr-datasets[vision]>=0.5.0",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "matplotlib>=3.7.0",  # 用于绘制训练和对比曲线
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["fedml"]
+
+[tool.flwr.app]
+publisher = "flwrlabs"
+
+[tool.flwr.app.components]
+serverapp = "fedml.server:app"
+clientapp = "fedml.client:app"
+
+[tool.flwr.app.config]
+# ============================================================
+# 1. FL 基础训练配置
+# ============================================================
+# 建议测试时设为 10，跑正式实验时设为 200
+num-server-rounds = 200       
+fraction-evaluate = 1.0      
+batch-size = 32
+learning-rate = 0.01         
+
+# ============================================================
+# 2. FO-MAML (First-Order MAML) 训练参数
+# ============================================================
+fomaml-alpha = 0.01
+fomaml-beta = 0.01
+fomaml-inner-steps = 5
+
+# ============================================================
+# 3. Meta-Testing (元评估) 参数
+# ============================================================
+meta-adapt-steps = 10
+meta-adapt-lr = 0.01
+
+# ============================================================
+# 4. 物理层通信链路参数 (用于模拟 LEO 环境)
+# ============================================================
+sigma2 = 1e-9
+default-distance-km = 780.0
+default-tau-d-s = 50000.0   
+
+w-u-hz = 4000000.0
+w-d-hz = 4000000.0
+p-u-w = 100.0
+p-d-w = 100.0
+f-c-hz = 20000000000.0
+A-T = 60.0
+A-R = 30.0
+G-H = 0.8
+delta = 2.0             
+psi-db-per-km = 0.5     
+zeta-km = 500.0         
+
+# ============================================================
+# 5. 距离随机化方案 (每个 Client 启动时生成)
+# ============================================================
+distance-km-min = 300.0
+distance-km-max = 1000.0
+distance-seed = 2026
+
+# ============================================================
+# 6. FedMeta 策略与成员管理参数
+# ============================================================
+selection-mode = "window"   
+ks-train = 8                
+ks-eval = 4                 
+enforce-comm = true         
+
+turnover-T = 5
+deltaQ = 2                  
+deltaP = 3                  
+probe-blocked-k = 1         
+
+# ============================================================
+# 7. Bidirectional Knowledge Distillation (Ground↔Satellite)
+# ============================================================
+kd-enable = true        
+kd-alpha = 0.5
+kd-temperature = 4.0
+kd-batch-size = 64
+kd-cal-samples = 2048
+kd-global-samples = 4096
+kd-forward-epochs = 1
+kd-forward-lr = 0.05
+kd-reverse-epochs = 1
+kd-reverse-lr = 0.01
+
+# ============================================================
+# 8. Client local training mode (optional)
+# ============================================================
+# 注意：由于我们在 server.py 写了自动化循序运行三种模式，
+# 这个参数在这里只是占位符，会被 server.py 在运行时动态覆盖。
+client-train-mode = "fomaml+apskd"   
+apskd-epochs = 1
+apskd-lr = 0.01
+
+[tool.flwr.federations]
+default = "local-simulation"
+
+[tool.flwr.federations.local-simulation]
+# 模拟的总节点数 (SuperNodes)
+options.num-supernodes = 5
+
+[tool.flwr.federations.local-simulation-gpu]
+options.num-supernodes = 5
+options.backend.client-resources.num-cpus = 2
+options.backend.client-resources.num-gpus = 0.2

@@ -1,0 +1,90 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "test"
+version = "1.0.0"
+description = "Federated Learning with Ground Distillation (Teacher-Student) and Link Simulation"
+license = "Apache-2.0"
+dependencies = [
+    "flwr[simulation]>=1.24.0",
+    "flwr-datasets[vision]>=0.5.0",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "matplotlib",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.flwr.app]
+publisher = "flwrlabs"
+
+[tool.flwr.app.components]
+serverapp = "fedavg.server:app"
+clientapp = "fedavg.client:app"
+
+[tool.flwr.app.config]
+# ---------- FL 基本配置 ----------
+num-server-rounds = 50
+fraction-evaluate = 1
+local-epochs = 5
+learning-rate = 0.01
+batch-size = 32
+
+# ---------- 知识蒸馏配置 (新增) ----------
+# 这些参数主要控制 FL 阶段客户端的蒸馏行为
+# 地面蒸馏的参数目前是在 server.py 代码中定义的，若需要也可以提取到这里
+kd-alpha = 0.7          # 蒸馏权重 (0.0=不蒸馏, 1.0=只用蒸馏Loss)
+kd-temperature = 3.0    # 蒸馏温度 (数值越大分布越平滑)
+
+# ---------- 通信/链路默认参数（server 下发给 client）----------
+sigma2 = 1e-9
+default-distance-km = 780.0
+default-tau-d-s = 50000.0
+
+w-u-hz = 4000000.0
+w-d-hz = 4000000.0
+p-u-w = 100.0
+p-d-w = 100.0
+f-c-hz = 20000000000.0
+
+A-T = 60
+A-R = 30
+G-H = 0.8
+delta = 2
+psi-db-per-km = 0.5
+zeta-km = 500.0
+
+# ---------- 方案1：每个节点启动时随机一次距离（固定）----------
+# 注意：只要你没有在 node_config 里显式写 distance-km，client 就会用这里随机生成
+distance-km-min = 300
+distance-km-max = 1000
+distance-seed = 2026
+
+# ---------- 服务器侧 FedAvg 策略参数（你改造的 fedavg.py 会读取）----------
+selection-mode = "window"     # "random" 或 "window"
+ks-train = 8
+ks-eval = 4
+enforce-comm = true
+
+turnover-T = 5
+deltaQ = 2
+deltaP = 3
+probe-blocked-k = 1
+
+[tool.flwr.federations]
+default = "local-simulation"
+
+[tool.flwr.federations.local-simulation]
+options.num-supernodes = 5
+
+[tool.flwr.federations.local-simulation-gpu]
+options.num-supernodes = 5
+options.backend.client-resources.num-cpus = 2
+options.backend.client-resources.num-gpus = 0.2
+
+[tool.flwr.federations.supergrid-deployment]
+address = "supergrid.flower.ai"
+enable-account-auth = true
