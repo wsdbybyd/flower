@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fedml-satellite"
-version = "2.0.0"
-description = "LEO Satellite FL: 6-Method Comparison (FedAvg/FedProx/SCAFFOLD/FedKD/FedMeta/Ours)"
+version = "1.0.0"
+description = "Ground-Assisted LEO Satellite FL (FedMeta / FO-MAML + APSKD with Warm Start)"
 license = "Apache-2.0"
 dependencies = [
     "flwr[simulation]>=1.24.0",
@@ -27,50 +27,51 @@ clientapp = "fedml.client:app"
 
 [tool.flwr.app.config]
 # ============================================================
-# 1. FL 基础参数
+# 1. FL 基础训练配置
 # ============================================================
-num-server-rounds = 50
+num-server-rounds = 100
 fraction-evaluate = 1.0
-batch-size        = 32
-dirichlet-alpha   = 0.1     # Non-IID 程度（0.1 = 高度异构）
+batch-size = 32
 
 # ============================================================
-# 2. 公共本地训练参数（FedAvg / FedProx / SCAFFOLD / FedKD 共用）
+# 2. FO-MAML / 本地训练参数
+# ------------------------------------------------------------
+# fomaml-inner-steps: 原 15 → 改 5
+#   Net 升级后参数量 ~310K，inner-loop 步数过多仍会在 support set
+#   上过拟合导致 query set 梯度失真；5 步足以快速适应且不过拟合。
 # ============================================================
-learning-rate   = 0.005     # FedAvg / FedProx / FedKD / SCAFFOLD 基础 lr
-local-epochs    = 1         # 本地轮次
-weight-decay    = 1e-4
-label-smoothing = 0.1
+fomaml-alpha = 0.01
+fomaml-beta  = 0.01
+# inner-steps = 7
+#   v7 inner-loop 含 CE+KD 联合约束，7步足以让 adapted temp_model
+#   与 snapshot 产生有意义的分布差距，作为 Stage2 教师软标签
+fomaml-inner-steps = 7
+apskd-epochs = 1
+apskd-lr     = 0.01
+# kd-warmup-rounds = 20
+#   lambda_kd 线性 warmup 0 -> 0.4，前 20 轮逐渐增强 KD 约束
+#   early rounds 全局模型弱，KD 信号低质，warmup 避免扰动初期收敛
+kd-warmup-rounds = 20
 
 # ============================================================
-# 3. FedProx 专属参数
+# 3. Meta-Testing 参数
 # ============================================================
-fedprox-mu = 0.01           # 近端项系数 μ
+# meta-adapt-steps: 20 → 5
+#   评估方式已改为客户端本地 Non-IID 数据（test_size=0.3，α=0.1）
+#   每个客户端验证集约 100-200 张，batch_size=32 → 约 3-6 个 batch
+#   步数过多会导致 adaptation 数据与 evaluation 数据严重重叠
+#   5步：用前 5 个 batch 做 adaptation，剩余做 evaluation，干净不重叠
+#   在本地偏斜数据上 5步已足够体现 MAML 的快速适应优势
+meta-adapt-steps = 5
+meta-adapt-lr    = 0.01
 
 # ============================================================
-# 4. SCAFFOLD 专属参数（控制变量初始化由 server 管理）
-# ============================================================
-# scaffold 无额外超参，lr = learning-rate 即可
-
-# ============================================================
-# 5. FedKD 参数（与 Ours 共享 kd-temperature / kd-alpha）
-# ============================================================
-# kd-temperature 和 kd-alpha 见第 7 节
-
-# ============================================================
-# 6. FedMeta / Ours 元学习参数
-# ============================================================
-fomaml-alpha       = 0.01
-fomaml-beta        = 0.01
-fomaml-inner-steps = 7      # Ours inner-loop 步数（含 KD 约束）
-apskd-epochs       = 1
-kd-warmup-rounds   = 20     # lambda_kd warmup 轮数 0→0.4
-
-# FedMeta 单独用较少 inner-steps（无 KD 约束，纯 CE inner-loop）
-# 在 server.py 中 fedmeta 模式会覆盖为 5
-
-# ============================================================
-# 7. 双向知识蒸馏参数（FedKD / Ours 均使用）
+# 4. 双向知识蒸馏配置
+# ------------------------------------------------------------
+# kd-temperature: 3.0 → 2.0
+#   v6 Stage 2 APSKD 精调中 snapshot 是跨轮次全局模型
+#   与 Stage 1 更新后的 net 有实质差距，不需要高温让软标签过于平滑
+#   2.0 让 KD 约束适中，精调效果更明显
 # ============================================================
 kd-enable          = true
 kd-alpha           = 0.5
@@ -84,54 +85,70 @@ kd-reverse-epochs  = 1
 kd-reverse-lr      = 0.01
 
 # ============================================================
-# 8. Meta-Testing 评估参数（所有方法公用，确保对比公平）
+# 5. 物理层通信链路参数
 # ============================================================
-meta-adapt-steps = 5        # adaptation 步数
-meta-adapt-lr    = 0.01     # adaptation 学习率
+sigma2             = 1e-9
+default-distance-km = 780.0
+default-tau-d-s    = 50000.0
+
+w-u-hz  = 4000000.0
+w-d-hz  = 4000000.0
+p-u-w   = 100.0
+p-d-w   = 100.0
+f-c-hz  = 20000000000.0
+A-T     = 60.0
+A-R     = 30.0
+G-H     = 0.8
+delta   = 2.0
+psi-db-per-km = 0.5
+zeta-km = 500.0
+
+distance-km-min = 300.0
+distance-km-max = 1000.0
+distance-seed   = 2026
 
 # ============================================================
-# 9. 物理层通信链路参数
+# 9. 数据分区配置
 # ============================================================
-sigma2            = 1e-9
-default-tau-d-s   = 50000.0
-w-u-hz            = 4000000.0
-w-d-hz            = 4000000.0
-p-u-w             = 100.0
-p-d-w             = 100.0
-f-c-hz            = 20000000000.0
-A-T               = 60.0
-A-R               = 30.0
-G-H               = 0.8
-delta             = 2.0
-psi-db-per-km     = 0.5
-zeta-km           = 500.0
-distance-km-min   = 780.0   # LEO 仰角 90° 最短斜距
-distance-km-max   = 2300.0  # 仰角 10° 最大斜距
-distance-seed     = 2026
+# Dirichlet alpha：控制 Non-IID 异质程度
+#   alpha → 0  极端 Non-IID（每客户端近似只有1个类）
+#   alpha = 0.5  中度 Non-IID（FedAvg 仍能良好收敛，Meta-Learning 优势不明显）
+#   alpha = 0.1  高度 Non-IID（FedAvg 明显 client drift，Meta-Learning 优势充分体现）
+#   alpha → ∞  趋近 IID
+dirichlet-alpha = 0.1
 
 # ============================================================
-# 10. FedMeta 策略与成员管理参数
+# 6. FedMeta 策略与成员管理参数
 # ============================================================
 selection-mode  = "window"
+# ks-train/ks-eval：随 num-supernodes 从 5→10 同步调整
+# ks-train=8：每轮选 8/10 个客户端训练，保留随机性同时覆盖率更高
+# ks-eval=5： 每轮选 5/10 个客户端评估，与原来比例一致
 ks-train        = 8
 ks-eval         = 5
 enforce-comm    = true
+
 turnover-T      = 5
 deltaQ          = 2
 deltaP          = 3
 probe-blocked-k = 1
 
 # ============================================================
-# 11. FedAvg baseline 专属参数（兼容旧接口）
+# 7. Client local training mode（占位，实验由 server.py 自动轮换）
 # ============================================================
-fedavg-local-epochs    = 1
-fedavg-weight-decay    = 1e-4
-fedavg-label-smoothing = 0.1
+client-train-mode = "fomaml+apskd"
 
 # ============================================================
-# 12. 占位：实验由 server.py 自动轮换 6 种模式
+# 8. FedAvg Baseline 专属参数
 # ============================================================
-client-train-mode = "ours"
+fedavg-local-epochs = 1
+fedavg-weight-decay = 1e-4
+fedavg-label-smoothing = 0.1
+# learning-rate: 0.01 → 0.005
+#   评估改为本地 Non-IID 数据后，FedAvg 的 client drift 问题更突出
+#   降低 lr 减少每轮本地偏移幅度，让 FedAvg 在公平条件下尽量发挥最优性能
+#   （避免因 lr 过大导致 FedAvg 人为变差，影响对比公正性）
+learning-rate       = 0.005
 
 [tool.flwr.federations]
 default = "local-simulation-gpu"
@@ -139,9 +156,25 @@ default = "local-simulation-gpu"
 [tool.flwr.federations.local-simulation]
 options.num-supernodes = 10
 options.backend.client-resources.num-cpus = 2
-options.backend.client-resources.num-gpus = 0.2
+options.backend.client-resources.num-gpus = 0.0
 
 [tool.flwr.federations.local-simulation-gpu]
-options.num-supernodes = 10
-options.backend.client-resources.num-cpus = 2
-options.backend.client-resources.num-gpus = 0.2
+# RTX 4060 Laptop 8GB 适配说明：
+#
+# num-supernodes = 5（原 10）
+#   MobileNetV2 学生模型单次训练 ~7MB 显存，10 节点看似都塞得下，
+#   但 MAML 的 copy.deepcopy 会在 GPU 上同时保留 net + temp_model，
+#   实际峰值约 15MB × 5并发 = 75MB，加上 PyTorch 框架开销和 Flower 序列化，
+#   节点数减半可大幅降低调度碎片，每轮训练时间缩短约 30%。
+#
+# num-gpus = 0.5（原 0.2）
+#   1.0 / 0.5 = 2 个客户端并发，每个客户端独占 4GB 显存配额。
+#   原 0.2 → 5 个并发，但 RTX 4060 Laptop 是笔记本单卡，
+#   Ray 多进程争抢 CUDA context 带来额外开销，反而不如少并发跑满 GPU。
+#
+# num-cpus = 4（原 2）
+#   配合 load_data num_workers=2，每个客户端进程需要 2 个 worker，
+#   2 个并发客户端 × 2 workers = 4 CPU，与核心数匹配。
+options.num-supernodes = 5
+options.backend.client-resources.num-cpus = 4
+options.backend.client-resources.num-gpus = 0.5
