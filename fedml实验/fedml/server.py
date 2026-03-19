@@ -102,83 +102,81 @@ def plot_metrics(result, filename: str = "training_metrics.png") -> None:
 
 
 def plot_multi_mode_comparison():
-    """扫描目录下的 JSON，绘制 4 种模式的 Test Accuracy 对比图（含 FedAvg baseline）"""
-    MODES  = ["fedavg",             "fomaml",       "apskd",        "fomaml+apskd"]
-    COLORS = ["#d62728",            "#1f77b4",       "#ff7f0e",      "#2ca02c"]
-    STYLES = ["--",                 "-",             "-",            "-"]
-    LABELS = ["FedAvg (Baseline)",  "Pure FO-MAML", "Pure APSKD",   "FO-MAML + APSKD (Mixed)"]
+    """扫描目录下的 JSON，绘制 6 种方法的 Test Accuracy 对比图"""
+    MODES  = ["fedavg",             "fedprox",                  "scaffold",                         "fedkd",              "fedmeta",                      "ours"]
+    COLORS = ["#d62728",            "#9467bd",                  "#8c564b",                          "#e377c2",            "#1f77b4",                      "#2ca02c"]
+    STYLES = ["--",                 "--",                       "--",                               "-.",                 "-",                            "-"]
+    LABELS = ["FedAvg",             "FedProx",                  "SCAFFOLD",                         "FedKD",              "FedMeta (FO-MAML)",            "Ours (FO-MAML+APSKD+KD)"]
 
-    plt.figure(figsize=(10, 6))
-    plt.style.use('default')
+    plt.figure(figsize=(12, 6))
+    plt.style.use("default")
 
     success_count = 0
     for mode, color, style, label in zip(MODES, COLORS, STYLES, LABELS):
         json_file = f"metrics_{mode}.json"
         if not os.path.exists(json_file):
             continue
-        with open(json_file, "r") as f:
+        with open(json_file) as f:
             data = json.load(f)
-        rounds = sorted([int(k) for k in data.keys()])
-        accuracies = [data[str(r)]["accuracy"] for r in rounds if data[str(r)].get("accuracy") is not None]
-        valid_rounds = [r for r in rounds if data[str(r)].get("accuracy") is not None]
-        if accuracies:
-            plt.plot(valid_rounds, accuracies, label=label, color=color,
-                     linestyle=style, linewidth=2, marker='o', markersize=4)
+        rounds = sorted(int(k) for k in data)
+        valid = [(r, data[str(r)]["accuracy"]) for r in rounds if data[str(r)].get("accuracy") is not None]
+        if valid:
+            rs, vs = zip(*valid)
+            plt.plot(rs, vs, label=label, color=color, linestyle=style,
+                     linewidth=2, marker="o", markersize=3)
             success_count += 1
 
     if success_count > 0:
-        plt.title("Accuracy Comparison: FedAvg Baseline vs FedMeta Variants (Non-IID, Client-Local Evaluation)", fontsize=13)
-        plt.xlabel("Server Round", fontsize=12)
-        plt.ylabel("Client-Aggregated Accuracy (Post-Adaptation on Local Non-IID Data)", fontsize=10)
-        plt.grid(True, linestyle="--", alpha=0.7)
-        plt.legend(fontsize=11)
+        plt.title("Test Accuracy: 6-Method Comparison (Dirichlet α=0.1)", fontsize=13)
+        plt.xlabel("Round", fontsize=12)
+        plt.ylabel("Accuracy (Post-Adaptation, Local Non-IID)", fontsize=11)
+        plt.grid(True, linestyle="--", alpha=0.6)
+        plt.legend(fontsize=10)
         from matplotlib.ticker import MaxNLocator
         plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
         plt.tight_layout()
-        save_path = "comparison_result_accuracy.png"
-        plt.savefig(save_path, dpi=300)
+        plt.savefig("comparison_accuracy.png", dpi=300)
         plt.close()
-        log(INFO, f"Comparison plot saved to: {save_path}")
+        log(INFO, "Saved: comparison_accuracy.png")
 
 
 def plot_train_loss_comparison():
-    """扫描目录下的 JSON，绘制 4 种模式的 Train Loss 对比图（含 FedAvg baseline）"""
-    MODES  = ["fedavg",             "fomaml",       "apskd",        "fomaml+apskd"]
-    COLORS = ["#d62728",            "#1f77b4",       "#ff7f0e",      "#2ca02c"]
-    STYLES = ["--",                 "-",             "-",            "-"]
-    LABELS = ["FedAvg (Baseline)",  "Pure FO-MAML", "Pure APSKD",   "FO-MAML + APSKD (Mixed)"]
+    """扫描目录下的 JSON，绘制 6 种方法的 Train Loss 对比图"""
+    MODES  = ["fedavg",   "fedprox",  "scaffold", "fedkd",    "fedmeta",           "ours"]
+    COLORS = ["#d62728",  "#9467bd",  "#8c564b",  "#e377c2",  "#1f77b4",           "#2ca02c"]
+    STYLES = ["--",       "--",       "--",       "-.",        "-",                 "-"]
+    LABELS = ["FedAvg",   "FedProx",  "SCAFFOLD", "FedKD",    "FedMeta (FO-MAML)", "Ours (FO-MAML+APSKD+KD)"]
 
-    plt.figure(figsize=(10, 6))
-    plt.style.use('default')
+    plt.figure(figsize=(12, 6))
+    plt.style.use("default")
 
     success_count = 0
     for mode, color, style, label in zip(MODES, COLORS, STYLES, LABELS):
         json_file = f"metrics_{mode}.json"
         if not os.path.exists(json_file):
             continue
-        with open(json_file, "r") as f:
+        with open(json_file) as f:
             data = json.load(f)
-        rounds = sorted([int(k) for k in data.keys()])
-        train_losses = [data[str(r)].get("train_loss") for r in rounds if data[str(r)].get("train_loss") is not None]
-        valid_rounds = [r for r in rounds if data[str(r)].get("train_loss") is not None]
-        if train_losses:
-            plt.plot(valid_rounds, train_losses, label=label, color=color,
-                     linestyle=style, linewidth=2, marker='o', markersize=4)
+        rounds = sorted(int(k) for k in data)
+        valid = [(r, data[str(r)]["train_loss"]) for r in rounds if data[str(r)].get("train_loss") is not None]
+        if valid:
+            rs, vs = zip(*valid)
+            plt.plot(rs, vs, label=label, color=color, linestyle=style,
+                     linewidth=2, marker="o", markersize=3)
             success_count += 1
 
     if success_count > 0:
-        plt.title("Client-side Aggregated Train Loss Comparison (With Warm Start)", fontsize=13)
-        plt.xlabel("Server Round", fontsize=12)
-        plt.ylabel("Train Loss (Aggregated)", fontsize=12)
-        plt.grid(True, linestyle="--", alpha=0.7)
-        plt.legend(fontsize=11)
+        plt.title("Train Loss: 6-Method Comparison", fontsize=13)
+        plt.xlabel("Round", fontsize=12)
+        plt.ylabel("Train Loss (Aggregated)", fontsize=11)
+        plt.grid(True, linestyle="--", alpha=0.6)
+        plt.legend(fontsize=10)
         from matplotlib.ticker import MaxNLocator
         plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
         plt.tight_layout()
-        save_path = "comparison_result_train_loss.png"
-        plt.savefig(save_path, dpi=300)
+        plt.savefig("comparison_train_loss.png", dpi=300)
         plt.close()
-        log(INFO, f"Train Loss comparison plot saved to: {save_path}")
+        log(INFO, "Saved: comparison_train_loss.png")
 
 
 # ============================================================
@@ -286,29 +284,39 @@ def main(grid: Grid, context: Context) -> None:
     }
 
     # ============================================================
-    # 依次执行 4 个模式（fedavg 作为 baseline 第一个跑）
+    # 依次执行 6 个模式（fedavg 作为 baseline 第一个跑）
     # ============================================================
-    modes_to_run = ["fedavg", "fomaml", "apskd", "fomaml+apskd"]
+    modes_to_run = ["fedavg", "fedprox", "scaffold", "fedkd", "fedmeta", "ours"]
 
-    log(INFO, "="*60)
-    log(INFO, "🚀 Starting automated sequential experiments for modes: %s", modes_to_run)
-    log(INFO, "="*60)
+    # 6 种方法的元信息（用于日志和绘图）
+    MODE_LABELS = {
+        "fedavg":   "FedAvg (McMahan et al., 2017)",
+        "fedprox":  "FedProx (Li et al., 2020)",
+        "scaffold": "SCAFFOLD (Karimireddy et al., 2020)",
+        "fedkd":    "FedKD (Wu et al., 2022)",
+        "fedmeta":  "FedMeta / FO-MAML (Finn et al., 2017)",
+        "ours":     "Ours (FO-MAML + APSKD + Bidirectional KD)",
+    }
 
-    for client_train_mode in modes_to_run:
-        log(INFO, "\n" + "*"*60)
-        if client_train_mode == "fedavg":
-            log(INFO, "⚪ NOW RUNNING MODE: FEDAVG (BASELINE, WITH WARM START)")
-        else:
-            log(INFO, "🔵 NOW RUNNING MODE: %s (WITH WARM START)", client_train_mode.upper())
-        log(INFO, "*"*60)
+    log(INFO, "=" * 60)
+    log(INFO, "🚀 Starting 6-method sequential comparison")
+    log(INFO, "   Modes: %s", modes_to_run)
+    log(INFO, "=" * 60)
 
-        # 所有模式均使用地面蒸馏后的 student 作为热启动初始参数
+    # SCAFFOLD 全局控制变量（跨轮次维护）
+    scaffold_c_global_str = ""
+
+    for mode in modes_to_run:
+        log(INFO, "\n" + "*" * 60)
+        log(INFO, "▶  MODE: %s", MODE_LABELS[mode])
+        log(INFO, "*" * 60)
+
         global_model = copy.deepcopy(distilled_student)
         arrays = ArrayRecord(global_model.state_dict())
 
-        # ---- 按模式分别构建 strategy / train_cfg / evaluate_fn ----
-        if client_train_mode == "fedavg":
-            # FedAvg baseline：复用 FedMeta 策略，关闭双向 KD
+        # ── 构建 strategy ──────────────────────────────────────────
+        if mode in ("fedavg", "fedprox", "scaffold"):
+            # 这三种方法不使用双向 KD
             strategy = FedMeta(
                 fraction_evaluate=fraction_evaluate,
                 selection_mode=selection_mode,
@@ -317,29 +325,12 @@ def main(grid: Grid, context: Context) -> None:
                 enforce_comm=enforce_comm,
                 turnover_T=turnover_T, deltaQ=deltaQ, deltaP=deltaP,
                 probe_blocked_k=probe_blocked_k,
-                kd_enable=False,        # FedAvg 不使用双向 KD
+                kd_enable=False,
                 initial_teacher_model=None,
             )
-            train_cfg = ConfigRecord({
-                **comm_defaults,
-                "client-train-mode": "fedavg",
-                "learning-rate":           float(cfg.get("learning-rate",           0.01)),
-                "fedavg-local-epochs":     int(  cfg.get("fedavg-local-epochs",     1)),
-                "fedavg-weight-decay":     float(cfg.get("fedavg-weight-decay",     1e-4)),
-                "fedavg-label-smoothing":  float(cfg.get("fedavg-label-smoothing",  0.1)),
-                "batch-size": batch_size,
-                "dirichlet-alpha": dirichlet_alpha,
-                "kd-enable": False,
-            })
-            # FedAvg 统一使用 meta_eval_config，与 FedMeta 系列评估标准完全一致
-            eval_cfg = ConfigRecord({**comm_defaults, **meta_eval_config})
-            # 评估改为客户端本地 Non-IID 数据聚合，服务器端不再跑全局 IID 测试集
-            evaluate_fn = make_global_evaluate_from_clients(
-                meta_adapt_steps=meta_adapt_steps, meta_adapt_lr=meta_adapt_lr
-            )
-
         else:
-            # FedMeta 系列三种模式：保持原有完整配置不变
+            # fedkd / fedmeta / ours：启用双向 KD
+            use_kd = kd_enable and (mode in ("fedkd", "ours"))
             strategy = FedMeta(
                 fraction_evaluate=fraction_evaluate,
                 selection_mode=selection_mode,
@@ -348,30 +339,89 @@ def main(grid: Grid, context: Context) -> None:
                 enforce_comm=enforce_comm,
                 turnover_T=turnover_T, deltaQ=deltaQ, deltaP=deltaP,
                 probe_blocked_k=probe_blocked_k,
-                kd_enable=kd_enable, kd_alpha=kd_alpha, kd_temperature=kd_temperature,
+                kd_enable=use_kd,
+                kd_alpha=kd_alpha, kd_temperature=kd_temperature,
                 kd_cal_samples=kd_cal_samples, kd_global_samples=kd_global_samples,
                 kd_batch_size=kd_batch_size,
                 kd_forward_epochs=kd_forward_epochs, kd_forward_lr=kd_forward_lr,
                 kd_reverse_epochs=kd_reverse_epochs, kd_reverse_lr=kd_reverse_lr,
                 initial_teacher_model=copy.deepcopy(distilled_teacher),
             )
-            train_cfg = ConfigRecord({
-                **comm_defaults,
-                **fomaml_config,
-                "client-train-mode": client_train_mode,
-                "apskd-epochs": apskd_epochs,
-                "apskd-lr": apskd_lr,
-                "kd-temperature": kd_temperature,
-                "kd-alpha": kd_alpha,
-                "kd-enable": kd_enable,
-                "kd-warmup-rounds": kd_warmup_rounds,
-            })
-            eval_cfg = ConfigRecord({**comm_defaults, **meta_eval_config})
-            # 评估改为客户端本地 Non-IID 数据聚合
-            evaluate_fn = make_global_evaluate_from_clients(
-                meta_adapt_steps=meta_adapt_steps, meta_adapt_lr=meta_adapt_lr
-            )
 
+        # ── 构建 train_cfg ─────────────────────────────────────────
+        base_cfg = {**comm_defaults, "batch-size": batch_size, "dirichlet-alpha": dirichlet_alpha}
+
+        if mode == "fedavg":
+            train_cfg = ConfigRecord({
+                **base_cfg,
+                "client-train-mode":    "fedavg",
+                "learning-rate":        float(cfg.get("learning-rate",        0.005)),
+                "local-epochs":         int(  cfg.get("fedavg-local-epochs",  1)),
+                "weight-decay":         float(cfg.get("fedavg-weight-decay",  1e-4)),
+                "label-smoothing":      float(cfg.get("fedavg-label-smoothing", 0.1)),
+                "kd-enable": False,
+            })
+
+        elif mode == "fedprox":
+            train_cfg = ConfigRecord({
+                **base_cfg,
+                "client-train-mode": "fedprox",
+                "learning-rate":     float(cfg.get("learning-rate",  0.005)),
+                "local-epochs":      int(  cfg.get("local-epochs",   1)),
+                "weight-decay":      float(cfg.get("weight-decay",   1e-4)),
+                "label-smoothing":   float(cfg.get("label-smoothing", 0.1)),
+                "fedprox-mu":        float(cfg.get("fedprox-mu",     0.01)),
+            })
+
+        elif mode == "scaffold":
+            train_cfg = ConfigRecord({
+                **base_cfg,
+                "client-train-mode":  "scaffold",
+                "learning-rate":      float(cfg.get("learning-rate", 0.01)),
+                "local-epochs":       int(  cfg.get("local-epochs",  1)),
+                "weight-decay":       float(cfg.get("weight-decay",  1e-4)),
+                "scaffold-c-global":  scaffold_c_global_str,
+            })
+
+        elif mode == "fedkd":
+            train_cfg = ConfigRecord({
+                **base_cfg,
+                "client-train-mode": "fedkd",
+                "learning-rate":     float(cfg.get("learning-rate", 0.005)),
+                "local-epochs":      int(  cfg.get("local-epochs",  1)),
+                "weight-decay":      float(cfg.get("weight-decay",  1e-4)),
+                "kd-temperature":    kd_temperature,
+                "kd-alpha":          kd_alpha,
+                "kd-enable":         True,
+            })
+
+        elif mode == "fedmeta":
+            train_cfg = ConfigRecord({
+                **base_cfg,
+                **fomaml_config,
+                "client-train-mode":  "fedmeta",
+                "kd-enable":          False,
+            })
+
+        else:  # ours
+            train_cfg = ConfigRecord({
+                **base_cfg,
+                **fomaml_config,
+                "client-train-mode":  "ours",
+                "apskd-epochs":       apskd_epochs,
+                "apskd-lr":           apskd_lr,
+                "kd-temperature":     kd_temperature,
+                "kd-alpha":           kd_alpha,
+                "kd-enable":          kd_enable,
+                "kd-warmup-rounds":   kd_warmup_rounds,
+            })
+
+        eval_cfg = ConfigRecord({**comm_defaults, **meta_eval_config})
+        evaluate_fn = make_global_evaluate_from_clients(
+            meta_adapt_steps=meta_adapt_steps, meta_adapt_lr=meta_adapt_lr
+        )
+
+        # ── 运行 ──────────────────────────────────────────────────
         result = strategy.start(
             grid=grid,
             initial_arrays=arrays,
@@ -381,52 +431,44 @@ def main(grid: Grid, context: Context) -> None:
             evaluate_fn=evaluate_fn,
         )
 
-        torch.save(result.arrays.to_torch_state_dict(), f"final_model_{client_train_mode}.pt")
-
-        if client_train_mode != "fedavg" and kd_enable:
-            teacher = getattr(strategy, "teacher_model", None)
-            if teacher is not None:
+        # ── 保存模型 ──────────────────────────────────────────────
+        torch.save(result.arrays.to_torch_state_dict(), f"final_model_{mode}.pt")
+        if mode in ("fedkd", "ours") and kd_enable:
+            teacher_saved = getattr(strategy, "teacher_model", None)
+            if teacher_saved is not None:
                 try:
-                    torch.save(teacher.state_dict(), f"teacher_model_{client_train_mode}.pt")
+                    torch.save(teacher_saved.state_dict(), f"teacher_model_{mode}.pt")
                 except Exception as e:
-                    log(WARNING, "Failed to save teacher model: %s", str(e))
+                    log(WARNING, "Failed to save teacher model: %s", e)
 
-        plot_filename = f"training_metrics_{client_train_mode}.png"
-        plot_metrics(result, filename=plot_filename)
+        # ── 绘制单轮训练曲线 ──────────────────────────────────────
+        plot_metrics(result, filename=f"training_metrics_{mode}.png")
 
-        # 评估结果来源：
-        #   history_eval_client = 客户端 evaluate() 回传的本地 Non-IID 评估聚合
-        #                         （eval_acc / eval_loss 字段）
-        #   history_train       = 客户端 train() 回传的训练指标（train_loss 字段）
-        history_eval_client = getattr(result, "evaluate_metrics_clientapp", None)
-        history_train = getattr(result, "train_metrics_clientapp", None)
-
-        if history_eval_client:
+        # ── 保存 JSON 指标 ─────────────────────────────────────────
+        h_eval  = getattr(result, "evaluate_metrics_clientapp", {}) or {}
+        h_train = getattr(result, "train_metrics_clientapp",    {}) or {}
+        if h_eval:
+            all_rounds = set(h_eval) | set(h_train)
             metrics_to_save = {}
-            all_rounds = set(history_eval_client.keys())
-            if history_train:
-                all_rounds |= set(history_train.keys())
             for r in sorted(all_rounds):
-                m_eval  = history_eval_client.get(r, {}) if history_eval_client else {}
-                m_train = history_train.get(r, {})       if history_train       else {}
+                me = h_eval.get(r,  {})
+                mt = h_train.get(r, {})
                 metrics_to_save[int(r)] = {
-                    "accuracy":   float(m_eval["eval_acc"])    if "eval_acc"   in m_eval  else None,
-                    "loss":       float(m_eval["eval_loss"])   if "eval_loss"  in m_eval  else None,
-                    "train_loss": float(m_train["train_loss"]) if "train_loss" in m_train else None,
+                    "accuracy":   float(me["eval_acc"])    if "eval_acc"   in me else None,
+                    "loss":       float(me["eval_loss"])   if "eval_loss"  in me else None,
+                    "train_loss": float(mt["train_loss"])  if "train_loss" in mt else None,
                 }
-            json_filename = f"metrics_{client_train_mode}.json"
-            with open(json_filename, "w") as f:
-                json.dump(metrics_to_save, f)
-            log(INFO, f"Metrics successfully saved to {json_filename}.")
+            with open(f"metrics_{mode}.json", "w") as f:
+                json.dump(metrics_to_save, f, indent=2)
+            log(INFO, "Saved metrics_%s.json", mode)
         else:
-            log(WARNING, "No client-side evaluate metrics found for mode: %s", client_train_mode)
+            log(WARNING, "No eval metrics for mode: %s", mode)
 
     # ============================================================
     # 全部循环结束后，绘制对比图
     # ============================================================
-    log(INFO, "\n" + "="*60)
-    log(INFO, "🎉 ALL EXPERIMENTS COMPLETED! Generating final comparison plots...")
-    log(INFO, "="*60)
-
+    log(INFO, "\n" + "=" * 60)
+    log(INFO, "🎉 ALL EXPERIMENTS DONE — Generating comparison plots...")
+    log(INFO, "=" * 60)
     plot_multi_mode_comparison()
     plot_train_loss_comparison()

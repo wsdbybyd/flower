@@ -121,11 +121,11 @@ dirichlet-alpha = 0.1
 # 6. FedMeta 策略与成员管理参数
 # ============================================================
 selection-mode  = "window"
-# ks-train/ks-eval：随 num-supernodes 从 5→10 同步调整
-# ks-train=8：每轮选 8/10 个客户端训练，保留随机性同时覆盖率更高
-# ks-eval=5： 每轮选 5/10 个客户端评估，与原来比例一致
-ks-train        = 8
-ks-eval         = 5
+# num-supernodes = 5，每轮参与节点数：
+# ks-train = 4：每轮选 4/5 个节点训练，覆盖率 80%，保留一定随机性
+# ks-eval  = 3：每轮选 3/5 个节点评估，与训练比例接近
+ks-train        = 4
+ks-eval         = 3
 enforce-comm    = true
 
 turnover-T      = 5
@@ -135,20 +135,55 @@ probe-blocked-k = 1
 
 # ============================================================
 # 7. Client local training mode（占位，实验由 server.py 自动轮换）
+#    server.py 会依次运行：fedavg → fedprox → scaffold → fedkd → fedmeta → ours
 # ============================================================
-client-train-mode = "fomaml+apskd"
+client-train-mode = "ours"
 
 # ============================================================
-# 8. FedAvg Baseline 专属参数
+# 8. 六大方法专属超参
 # ============================================================
-fedavg-local-epochs = 1
-fedavg-weight-decay = 1e-4
+
+# ── FedAvg (McMahan et al., 2017) ───────────────────────────
+# 标准 SGD + Weight Decay + Label Smoothing
+# learning-rate 调低至 0.005：Non-IID 场景下减少 client drift，
+# 保证 FedAvg 在公平条件下发挥最优性能，避免 lr 过大人为劣化
+fedavg-local-epochs    = 1
+fedavg-weight-decay    = 1e-4
 fedavg-label-smoothing = 0.1
-# learning-rate: 0.01 → 0.005
-#   评估改为本地 Non-IID 数据后，FedAvg 的 client drift 问题更突出
-#   降低 lr 减少每轮本地偏移幅度，让 FedAvg 在公平条件下尽量发挥最优性能
-#   （避免因 lr 过大导致 FedAvg 人为变差，影响对比公正性）
-learning-rate       = 0.005
+learning-rate          = 0.005
+
+# ── FedProx (Li et al., 2020) ───────────────────────────────
+# 在 FedAvg 基础上加入近端项 (mu/2)||w - w_global||²
+# mu=0.01：近端项强度，越大越约束本地更新靠近全局模型
+#   mu 太小 ≈ FedAvg，mu 太大 → 本地更新被过度压制，精度下降
+#   0.01 是文献推荐值，在中高 Non-IID (α=0.1) 下效果稳定
+fedprox-mu      = 0.01
+local-epochs    = 1
+weight-decay    = 1e-4
+label-smoothing = 0.1
+
+# ── SCAFFOLD (Karimireddy et al., 2020) ─────────────────────
+# 控制变量 (c_i, c) 修正本地梯度，消除 client drift
+# scaffold-lr：SCAFFOLD 推荐使用比 FedAvg 略大的 lr，
+#   因为梯度已被控制变量修正，不需要通过小 lr 来抑制漂移
+scaffold-lr     = 0.01
+
+# ── FedKD (Wu et al., 2022) ─────────────────────────────────
+# 服务器端教师模型软标签蒸馏客户端学生模型
+# kd-temperature 与 Ours 共用（见第4节），此处不重复
+# fedkd-lr：FedKD 使用软标签监督，梯度方差比纯 CE 小，可适当加大 lr
+fedkd-lr        = 0.005
+
+# ── FedMeta / FO-MAML (Finn et al., 2017) ───────────────────
+# 元学习内外循环参数见第2节（fomaml-alpha / fomaml-beta / fomaml-inner-steps）
+# FedMeta 不使用双向 KD（kd-enable 对 fedmeta 模式无效）
+
+# ── Ours (FO-MAML + APSKD + Bidirectional KD) ───────────────
+# 完整方法参数：
+#   内循环    → fomaml-alpha, fomaml-inner-steps（第2节）
+#   外循环    → fomaml-beta（第2节）
+#   APSKD精调 → apskd-epochs, apskd-lr, kd-warmup-rounds（第2节）
+#   双向KD    → kd-* 系列参数（第4节）
 
 [tool.flwr.federations]
 default = "local-simulation-gpu"
