@@ -1,433 +1,596 @@
-import os
-import json
-import copy
-import torch
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+from __future__ import annotations
+
+import random
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from logging import INFO, WARNING
+from time import sleep
+from typing import Any, Optional
 
-from flwr.app import ArrayRecord, ConfigRecord, Context, MetricRecord
-from flwr.common import log
-from flwr.serverapp import Grid, ServerApp
+import torch
+from flwr.common import (
+    ArrayRecord,
+    ConfigRecord,
+    Message,
+    MessageType,
+    MetricRecord,
+    RecordDict,
+    log,
+)
+from flwr.server import Grid
 
-from fedml.fedml import FedMeta
+from fedml.exception import InconsistentMessageReplies
+from fedml.strategy import Strategy
+from fedml.strategy_utils import (
+    aggregate_arrayrecords,
+    aggregate_metricrecords,
+    validate_message_reply_consistency,
+)
+
+# 引入更新后的任务模块：使用 BigTeacherNet 对齐 FedAvg 实验的深度网络
 from fedml.task import (
     Net,
     BigTeacherNet,
-    test_centralized_dataset,
-    test_meta,
-    load_centralized_dataset_train_test,
-    train_centralized,
-    distill_centralized,
-    calibrate_bn,
-    test
+    build_dcal_loader,
+    build_dglobal_loader,
+    distill_teacher_to_student,
+    reverse_distill_student_to_teacher,
+    calibrate_bn_stats,
 )
 
-app = ServerApp()
 
-# ============================================================
-# 1. 地面预蒸馏模块 (Ground Pre-training / Warm Start)
-# ============================================================
-def perform_ground_distillation_experiment(device):
-    log(INFO, "\n" + "="*60)
-    log(INFO, "🚀 [预处理] 启动地面蒸馏 (Ground Warm-up) for FedMeta")
-    log(INFO, "="*60)
-
-    trainloader, testloader = load_centralized_dataset_train_test()
-    teacher = BigTeacherNet()
-    student = Net()
-
-    # Teacher epochs: 2 → 10
-    #   ResNet-18 训 2 epoch 精度仅约 70%，软标签接近均匀分布，
-    #   KL 损失迫使学生把输出压平，与 CE 损失对抗 → Loss 发散。
-    #   10 epoch 精度约 88%，软标签有意义，KD 正常收敛。
-    #   RTX 4060 Laptop 约需 2~3 分钟，值得等待。
-    teacher_epochs = 10
-    student_epochs = 5    # Student 蒸馏 5 epoch，充分吸收教师知识
-    lr = 0.01
-
-    log(INFO, "1. 训练 Teacher 模型 (%d epochs)...", teacher_epochs)
-    train_centralized(teacher, trainloader, epochs=teacher_epochs, lr=lr, device=device)
-
-    log(INFO, "2. 蒸馏 Student 模型 Teacher→Student (%d epochs)...", student_epochs)
-    distill_centralized(student, teacher, trainloader,
-                        epochs=student_epochs, lr=lr, device=device, temp=2.0, alpha=0.5)
-
-    loss, acc = test(student, testloader, device)
-    log(INFO, "✅ 地面蒸馏完成，Student 初始精度: %.2f%%", acc * 100)
-
-    return student, teacher
-
-# ============================================================
-# 2. 绘图工具函数
-# ============================================================
-def plot_metrics(result, filename: str = "training_metrics.png") -> None:
-    """绘制单次运行的 Accuracy 和 Loss 折线图（来自客户端本地评估聚合）"""
-    history = getattr(result, "evaluate_metrics_clientapp", None)
-    if not history:
-        log(INFO, "No client-side evaluation metrics found to plot.")
-        return
-
-    rounds = sorted(history.keys())
-    accuracies = [history[r].get("eval_acc") for r in rounds]
-    losses     = [history[r].get("eval_loss") for r in rounds]
-
-    plt.style.use("default")
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-
-    valid_acc = [(r, v) for r, v in zip(rounds, accuracies) if v is not None]
-    if valid_acc:
-        rs, vs = zip(*valid_acc)
-        ax1.plot(rs, vs, marker="o", linewidth=2, label="Accuracy (Post-Adaptation)")
-        ax1.set_title("Client-Aggregated Meta-Test Accuracy (Local Non-IID)", fontsize=14)
-        ax1.set_xlabel("Round", fontsize=12)
-        ax1.set_ylabel("Accuracy", fontsize=12)
-        ax1.grid(True)
-        ax1.legend()
-
-    valid_loss = [(r, v) for r, v in zip(rounds, losses) if v is not None]
-    if valid_loss:
-        rs, vs = zip(*valid_loss)
-        ax2.plot(rs, vs, marker="o", linewidth=2, label="Loss")
-        ax2.set_title("Client-Aggregated Meta-Test Loss (Local Non-IID)", fontsize=14)
-        ax2.set_xlabel("Round", fontsize=12)
-        ax2.set_ylabel("Loss", fontsize=12)
-        ax2.grid(True)
-        ax2.legend()
-
-    plt.tight_layout()
-    plt.savefig(filename, dpi=300)
-    plt.close(fig)
-    log(INFO, f"Training plots saved to: {filename}")
+@dataclass
+class _LinkState:
+    """链路状态缓存（用于通信感知调度与成员管理）"""
+    tau_d_s: float | None = None
+    window_margin_s: float | None = None
+    comm_ok: bool | None = None
+    t_total_s: float | None = None
 
 
-def plot_multi_mode_comparison():
-    """扫描目录下的 JSON，绘制 4 种模式的 Test Accuracy 对比图（含 FedAvg baseline）"""
-    MODES  = ["fedavg",             "fomaml",       "apskd",        "fomaml+apskd"]
-    COLORS = ["#d62728",            "#1f77b4",       "#ff7f0e",      "#2ca02c"]
-    STYLES = ["--",                 "-",             "-",            "-"]
-    LABELS = ["FedAvg (Baseline)",  "Pure FO-MAML", "Pure APSKD",   "FO-MAML + APSKD (Mixed)"]
-
-    plt.figure(figsize=(10, 6))
-    plt.style.use('default')
-
-    success_count = 0
-    for mode, color, style, label in zip(MODES, COLORS, STYLES, LABELS):
-        json_file = f"metrics_{mode}.json"
-        if not os.path.exists(json_file):
-            continue
-        with open(json_file, "r") as f:
-            data = json.load(f)
-        rounds = sorted([int(k) for k in data.keys()])
-        accuracies = [data[str(r)]["accuracy"] for r in rounds if data[str(r)].get("accuracy") is not None]
-        valid_rounds = [r for r in rounds if data[str(r)].get("accuracy") is not None]
-        if accuracies:
-            plt.plot(valid_rounds, accuracies, label=label, color=color,
-                     linestyle=style, linewidth=2, marker='o', markersize=4)
-            success_count += 1
-
-    if success_count > 0:
-        plt.title("Accuracy Comparison: FedAvg Baseline vs FedMeta Variants (Non-IID, Client-Local Evaluation)", fontsize=13)
-        plt.xlabel("Server Round", fontsize=12)
-        plt.ylabel("Client-Aggregated Accuracy (Post-Adaptation on Local Non-IID Data)", fontsize=10)
-        plt.grid(True, linestyle="--", alpha=0.7)
-        plt.legend(fontsize=11)
-        from matplotlib.ticker import MaxNLocator
-        plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-        plt.tight_layout()
-        save_path = "comparison_result_accuracy.png"
-        plt.savefig(save_path, dpi=300)
-        plt.close()
-        log(INFO, f"Comparison plot saved to: {save_path}")
+def _metricrecord_to_dict(mr: Any) -> dict[str, Any]:
+    """将 MetricRecord 转成普通 dict，方便读取 key。"""
+    if mr is None:
+        return {}
+    try:
+        return dict(mr)
+    except Exception:
+        pass
+    for attr in ("to_dict", "as_dict", "dict"):
+        if hasattr(mr, attr):
+            try:
+                return getattr(mr, attr)()
+            except Exception:
+                pass
+    try:
+        out = {}
+        for k in mr:
+            out[k] = mr[k]
+        return out
+    except Exception:
+        return {}
 
 
-def plot_train_loss_comparison():
-    """扫描目录下的 JSON，绘制 4 种模式的 Train Loss 对比图（含 FedAvg baseline）"""
-    MODES  = ["fedavg",             "fomaml",       "apskd",        "fomaml+apskd"]
-    COLORS = ["#d62728",            "#1f77b4",       "#ff7f0e",      "#2ca02c"]
-    STYLES = ["--",                 "-",             "-",            "-"]
-    LABELS = ["FedAvg (Baseline)",  "Pure FO-MAML", "Pure APSKD",   "FO-MAML + APSKD (Mixed)"]
-
-    plt.figure(figsize=(10, 6))
-    plt.style.use('default')
-
-    success_count = 0
-    for mode, color, style, label in zip(MODES, COLORS, STYLES, LABELS):
-        json_file = f"metrics_{mode}.json"
-        if not os.path.exists(json_file):
-            continue
-        with open(json_file, "r") as f:
-            data = json.load(f)
-        rounds = sorted([int(k) for k in data.keys()])
-        train_losses = [data[str(r)].get("train_loss") for r in rounds if data[str(r)].get("train_loss") is not None]
-        valid_rounds = [r for r in rounds if data[str(r)].get("train_loss") is not None]
-        if train_losses:
-            plt.plot(valid_rounds, train_losses, label=label, color=color,
-                     linestyle=style, linewidth=2, marker='o', markersize=4)
-            success_count += 1
-
-    if success_count > 0:
-        plt.title("Client-side Aggregated Train Loss Comparison (With Warm Start)", fontsize=13)
-        plt.xlabel("Server Round", fontsize=12)
-        plt.ylabel("Train Loss (Aggregated)", fontsize=12)
-        plt.grid(True, linestyle="--", alpha=0.7)
-        plt.legend(fontsize=11)
-        from matplotlib.ticker import MaxNLocator
-        plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-        plt.tight_layout()
-        save_path = "comparison_result_train_loss.png"
-        plt.savefig(save_path, dpi=300)
-        plt.close()
-        log(INFO, f"Train Loss comparison plot saved to: {save_path}")
+def _cfg_get(cfg: ConfigRecord, key: str, default: Any) -> Any:
+    try:
+        return cfg[key]
+    except Exception:
+        return default
 
 
-# ============================================================
-# 3. 构造评估闭包
-#    ── 评估方式修改说明 ─────────────────────────────────────────────
-#    原方案：服务器用全局 IID 测试集做 test_meta → 对 FedAvg 天然有利
-#      FedAvg 的全局模型本来就是在全局分布上优化的，
-#      在 IID 测试集上 adaptation 20步 = 在"熟悉的数据"上微调，效果极好。
-#      MAML 系列的快速适应优势场景是"陌生的偏斜分布"，在 IID 测试集上体现不出来。
-#
-#    新方案：各客户端用自己的本地 Non-IID 数据做 test_meta，回传 eval_acc，
-#      服务器聚合各客户端的 eval_acc 作为全局指标（加权平均）。
-#      → FedAvg 因 client drift 在本地偏斜数据上 adaptation 效果差
-#      → MAML 系列训练时已见过各种偏斜分布，本地快速适应能力更强
-#      → 这才是真实卫星场景：每颗卫星只能用自己的数据做适应
-# ============================================================
-def make_global_evaluate_from_clients(meta_adapt_steps: int, meta_adapt_lr: float) -> callable:
+def _cfg_bool(cfg: ConfigRecord, key: str, default: bool) -> bool:
+    v = _cfg_get(cfg, key, default)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(v)
+
+
+def _cfg_int(cfg: ConfigRecord, key: str, default: int) -> int:
+    v = _cfg_get(cfg, key, default)
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+
+def _cfg_float(cfg: ConfigRecord, key: str, default: float) -> float:
+    v = _cfg_get(cfg, key, default)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+class FedMeta(Strategy):
     """
-    占位 evaluate_fn：不在服务器端跑全局评估，
-    改为依赖客户端回传的 eval_acc 聚合（在 aggregate_evaluate 里处理）。
-    返回 None 让框架跳过服务器端评估，只用客户端聚合结果。
+    FedMeta（FO-MAML/Reptile 风格） + 通信感知调度 + 动态成员管理
+    + 双向蒸馏 Bidirectional KD (带有地面热启动 Teacher 支持)
+
+    (1) Ground→Satellite：在每轮下发前，用 D_cal 让 student 向 teacher 蒸馏，得到更好的初始化再下发
+    (2) Student→Teacher：每轮聚合后，用 D_global 让 teacher 向聚合 student 反向蒸馏更新
     """
-    def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
-        # 不在服务器端用全局 IID 测试集评估
-        # 真实评估结果来自各客户端本地 Non-IID 数据的 eval_acc 聚合
-        return None
-    return global_evaluate
 
+    def __init__(
+        self,
+        fraction_train: float = 1.0,
+        fraction_evaluate: float = 1.0,
+        min_train_nodes: int = 2,
+        min_evaluate_nodes: int = 2,
+        min_available_nodes: int = 2,
+        weighted_by_key: str = "num-examples",
+        arrayrecord_key: str = "arrays",
+        configrecord_key: str = "config",
+        train_metrics_aggr_fn: Callable[[list[RecordDict], str], MetricRecord] | None = None,
+        evaluate_metrics_aggr_fn: Callable[[list[RecordDict], str], MetricRecord] | None = None,
 
-# ============================================================
-# 4. 主程序入口
-# ============================================================
-@app.main()
-def main(grid: Grid, context: Context) -> None:
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        # --- 调度参数 ---
+        selection_mode: str = "random",  # "window" or "random"
+        ks_train: int | None = None,
+        ks_evaluate: int | None = None,
+        enforce_comm: bool = False,
+        turnover_T: int = 10,
+        deltaQ: int = 999999,
+        deltaP: int = 999999,
+        probe_blocked_k: int = 1,
 
-    # ============================================================
-    # 执行地面预热 (获取热启动的初始参数)
-    # ============================================================
-    distilled_student, distilled_teacher = perform_ground_distillation_experiment(device)
+        # --- 双向蒸馏参数 ---
+        kd_enable: bool = False,
+        kd_alpha: float = 0.5,
+        kd_temperature: float = 4.0,
+        kd_cal_samples: int = 2048,
+        kd_global_samples: int = 4096,
+        kd_batch_size: int = 64,
+        kd_forward_epochs: int = 1,
+        kd_forward_lr: float = 0.05,
+        kd_reverse_epochs: int = 1,
+        kd_reverse_lr: float = 0.01,
+        kd_cal_split: str = "train",
+        kd_global_split: str = "train",
+        kd_device: str | None = None,  # "cuda" / "cpu" / None(自动)
+        
+        # --- [新增] 接收来自 server.py 的热启动 Teacher 模型 ---
+        initial_teacher_model: Optional[torch.nn.Module] = None,
+    ) -> None:
+        # --- Flower/FedMeta 基础 ---
+        self.fraction_train = fraction_train
+        self.fraction_evaluate = fraction_evaluate
+        self.min_train_nodes = min_train_nodes
+        self.min_evaluate_nodes = min_evaluate_nodes
+        self.min_available_nodes = min_available_nodes
+        self.weighted_by_key = weighted_by_key
+        self.arrayrecord_key = arrayrecord_key
+        self.configrecord_key = configrecord_key
+        self.train_metrics_aggr_fn = train_metrics_aggr_fn or aggregate_metricrecords
+        self.evaluate_metrics_aggr_fn = evaluate_metrics_aggr_fn or aggregate_metricrecords
 
-    # 读取全局配置
-    cfg = context.run_config
-    fraction_evaluate = float(cfg.get("fraction-evaluate", 1.0))
-    num_rounds = int(cfg.get("num-server-rounds", 10))
-    selection_mode = str(cfg.get("selection-mode", "window"))
-    ks_train = cfg.get("ks-train", None)
-    ks_eval = cfg.get("ks-eval", None)
-    enforce_comm = bool(cfg.get("enforce-comm", True))
+        if self.fraction_evaluate == 0.0:
+            self.min_evaluate_nodes = 0
+            log(WARNING, "fraction_evaluate is set to 0.0. Federated evaluate will be disabled.")
 
-    turnover_T = int(cfg.get("turnover-T", 5))
-    deltaQ = int(cfg.get("deltaQ", 2))
-    deltaP = int(cfg.get("deltaP", 3))
-    probe_blocked_k = int(cfg.get("probe-blocked-k", 1))
+        # --- 调度与链路状态 ---
+        self.selection_mode = selection_mode
+        self.ks_train = ks_train
+        self.ks_evaluate = ks_evaluate
+        self.enforce_comm = enforce_comm
+        self._link_state: dict[int, _LinkState] = {}
 
-    batch_size = int(cfg.get("batch-size", 32))
-    dirichlet_alpha = float(cfg.get("dirichlet-alpha", 0.1))
-    fomaml_config = {
-        "fomaml-alpha": float(cfg.get("fomaml-alpha", 0.01)),
-        "fomaml-beta": float(cfg.get("fomaml-beta", 0.01)),
-        "fomaml-inner-steps": int(cfg.get("fomaml-inner-steps", 5)),
-        "batch-size": batch_size,
-        "dirichlet-alpha": dirichlet_alpha,
-    }
+        # --- 成员管理 ---
+        self.turnover_T = max(int(turnover_T), 1)
+        self.deltaQ = int(deltaQ)
+        self.deltaP = int(deltaP)
+        self._connected_history: list[set[int]] = []
+        self._comm_hist: dict[int, list[int]] = {}
+        self._blocked: set[int] = set()
+        self.probe_blocked_k = max(int(probe_blocked_k), 0)
 
-    meta_adapt_steps = int(cfg.get("meta-adapt-steps", 10))
-    meta_adapt_lr = float(cfg.get("meta-adapt-lr", 0.01))
-    meta_eval_config = {
-        "meta-adapt-steps": meta_adapt_steps,
-        "meta-adapt-lr": meta_adapt_lr,
-        "batch-size": batch_size,
-        "dirichlet-alpha": dirichlet_alpha,
-    }
+        # --- 双向蒸馏（Teacher & Datasets）---
+        self._kd_enable = bool(kd_enable)
+        self._kd_alpha = float(kd_alpha)
+        self._kd_temperature = float(kd_temperature)
+        self._kd_cal_samples = int(kd_cal_samples)
+        self._kd_global_samples = int(kd_global_samples)
+        self._kd_batch_size = int(kd_batch_size)
+        self._kd_forward_epochs = int(kd_forward_epochs)
+        self._kd_forward_lr = float(kd_forward_lr)
+        self._kd_reverse_epochs = int(kd_reverse_epochs)
+        self._kd_reverse_lr = float(kd_reverse_lr)
+        self._kd_cal_split = str(kd_cal_split)
+        self._kd_global_split = str(kd_global_split)
+        self._kd_device_pref = kd_device  
 
-    kd_enable = bool(cfg.get("kd-enable", True))
-    kd_alpha = float(cfg.get("kd-alpha", 0.5))
-    kd_temperature = float(cfg.get("kd-temperature", 2.0))
-    kd_cal_samples = int(cfg.get("kd-cal-samples", 2048))
-    kd_global_samples = int(cfg.get("kd-global-samples", 4096))
-    kd_batch_size = int(cfg.get("kd-batch-size", 64))
-    kd_forward_epochs = int(cfg.get("kd-forward-epochs", 1))
-    kd_forward_lr = float(cfg.get("kd-forward-lr", 0.05))
-    kd_reverse_epochs = int(cfg.get("kd-reverse-epochs", 1))
-    kd_reverse_lr = float(cfg.get("kd-reverse-lr", 0.01))
+        # [新增] 初始化 Teacher 为传入的热启动模型
+        self.teacher_model = initial_teacher_model
+        
+        self._dcal_loader = None
+        self._dglobal_loader = None
 
-    apskd_epochs = int(cfg.get("apskd-epochs", 5))
-    apskd_lr = float(cfg.get("apskd-lr", 0.01))
-    kd_warmup_rounds = int(cfg.get("kd-warmup-rounds", 2))
+        # 记录本轮 forward KD loss
+        self._last_kd_forward_round: Optional[int] = None
+        self._last_kd_forward_loss: Optional[float] = None
 
-    comm_defaults = {
-        "sigma2": float(cfg.get("sigma2", 1e-9)),
-        "default-distance-km": float(cfg.get("default-distance-km", 780.0)),
-        "default-tau-d-s": float(cfg.get("default-tau-d-s", 50000.0)),
-        "w-u-hz": float(cfg.get("w-u-hz", 4e6)),
-        "w-d-hz": float(cfg.get("w-d-hz", 4e6)),
-        "p-u-w": float(cfg.get("p-u-w", 100.0)),
-        "p-d-w": float(cfg.get("p-d-w", 100.0)),
-        "f-c-hz": float(cfg.get("f-c-hz", 20e9)),
-        "A-T": float(cfg.get("A-T", 60.0)),
-        "A-R": float(cfg.get("A-R", 30.0)),
-        "G-H": float(cfg.get("G-H", 0.8)),
-        "delta": float(cfg.get("delta", 2.0)),
-        "psi-db-per-km": float(cfg.get("psi-db-per-km", 0.5)),
-        "zeta-km": float(cfg.get("zeta-km", 500.0)),
-    }
+    # -------------------------------------------------------------------------
+    # 基础工具
+    # -------------------------------------------------------------------------
 
-    # ============================================================
-    # 依次执行 4 个模式（fedavg 作为 baseline 第一个跑）
-    # ============================================================
-    modes_to_run = ["fedavg", "fomaml", "apskd", "fomaml+apskd"]
+    def summary(self) -> None:
+        log(INFO, "\t└── Summary: FedMeta(selection_mode=%s, enforce_comm=%s, kd_enable=%s)",
+            self.selection_mode, self.enforce_comm, self._kd_enable)
+        if self.teacher_model is not None:
+            log(INFO, "\t    [Initialized with Pre-trained Ground Teacher]")
 
-    log(INFO, "="*60)
-    log(INFO, "🚀 Starting automated sequential experiments for modes: %s", modes_to_run)
-    log(INFO, "="*60)
+    def _construct_messages(self, record: RecordDict, node_ids: list[int], message_type: MessageType) -> list[Message]:
+        messages: list[Message] = []
+        for node_id in node_ids:
+            messages.append(Message(content=record, message_type=message_type, dst_node_id=node_id))
+        return messages
 
-    for client_train_mode in modes_to_run:
-        log(INFO, "\n" + "*"*60)
-        if client_train_mode == "fedavg":
-            log(INFO, "⚪ NOW RUNNING MODE: FEDAVG (BASELINE, WITH WARM START)")
+    def _wait_for_nodes(self, grid: Grid, min_available_nodes: int) -> list[int]:
+        while len(all_nodes := list(grid.get_node_ids())) < min_available_nodes:
+            log(INFO, "Waiting for nodes to connect: %d connected (minimum required: %d).",
+                len(all_nodes), min_available_nodes)
+            sleep(1)
+        return all_nodes
+
+    # -------------------------------------------------------------------------
+    # 成员管理 / 调度
+    # -------------------------------------------------------------------------
+
+    def _push_comm_hist(self, nid: int, ok: bool) -> None:
+        hist = self._comm_hist.get(nid, [])
+        hist.append(1 if ok else 0)
+        if len(hist) > self.turnover_T:
+            hist = hist[-self.turnover_T:]
+        self._comm_hist[nid] = hist
+
+    def _update_membership(self, nid: int) -> None:
+        hist = self._comm_hist.get(nid, [])
+        if not hist:
+            return
+        ok_cnt = sum(hist)
+        fail_cnt = len(hist) - ok_cnt
+
+        if (nid not in self._blocked) and (fail_cnt >= self.deltaP):
+            self._blocked.add(nid)
+            log(WARNING, "Node %d blocked (fail_cnt=%d in last %d rounds)", nid, fail_cnt, len(hist))
+
+        if (nid in self._blocked) and (ok_cnt >= self.deltaQ):
+            self._blocked.remove(nid)
+            log(INFO, "Node %d unblocked (ok_cnt=%d in last %d rounds)", nid, ok_cnt, len(hist))
+
+    def _select_by_window(self, node_ids: list[int], k: int) -> list[int]:
+        def score(nid: int) -> tuple[int, float, float]:
+            st = self._link_state.get(nid, _LinkState())
+            tau = st.tau_d_s if st.tau_d_s is not None else -1e18
+            margin = st.window_margin_s if st.window_margin_s is not None else -1e18
+            comm_ok = bool(st.comm_ok) if st.comm_ok is not None else False
+            feasible = (not self.enforce_comm) or comm_ok
+            return (1 if feasible else 0, margin, tau)
+
+        ranked = sorted(node_ids, key=score, reverse=True)
+
+        if self.enforce_comm:
+            feasible = [nid for nid in ranked if (self._link_state.get(nid, _LinkState()).comm_ok is True)]
+            picked = feasible[:k]
+            if len(picked) < k:
+                for nid in ranked:
+                    if nid not in picked:
+                        picked.append(nid)
+                    if len(picked) >= k:
+                        break
+            return picked
+
+        return ranked[:k]
+
+    def _filter_and_probe(self, all_nodes: list[int], sample_size: int) -> tuple[list[int], list[int], list[int]]:
+        blocked = set(self._blocked)
+        candidates = [nid for nid in all_nodes if nid not in blocked]
+        blocked_list = list(blocked)
+
+        if not candidates and blocked_list:
+            candidates = blocked_list[:]
+
+        probe: list[int] = []
+        if blocked_list and self.probe_blocked_k > 0:
+            k = min(self.probe_blocked_k, len(blocked_list))
+            probe = blocked_list[:k]
+
+        return candidates, probe, blocked_list
+
+    def _update_link_state_from_replies(self, replies: list[Message]) -> None:
+        for msg in replies:
+            nid = msg.metadata.src_node_id
+            content = msg.content
+            if "metrics" not in content:
+                continue
+            md = _metricrecord_to_dict(content["metrics"])
+
+            st = self._link_state.get(nid, _LinkState())
+            st.tau_d_s = float(md.get("tau_d_s", st.tau_d_s or 0.0))
+            st.window_margin_s = float(md.get("window_margin_s", st.window_margin_s or 0.0))
+            st.t_total_s = float(md.get("T_total_s", st.t_total_s or 0.0))
+
+            raw_comm_ok = md.get("comm_ok", None)
+            if raw_comm_ok is not None:
+                st.comm_ok = bool(int(raw_comm_ok))
+
+            self._link_state[nid] = st
+
+            if st.comm_ok is not None:
+                self._push_comm_hist(nid, bool(st.comm_ok))
+                self._update_membership(nid)
+
+    def _check_and_log_replies(self, replies: Iterable[Message], is_train: bool) -> tuple[list[Message], list[Message]]:
+        valid_replies: list[Message] = []
+        error_replies: list[Message] = []
+        for msg in replies:
+            if msg.has_error():
+                error_replies.append(msg)
+            else:
+                valid_replies.append(msg)
+
+        log(INFO, "%s: Received %s results and %s failures",
+            "aggregate_train" if is_train else "aggregate_evaluate",
+            len(valid_replies), len(error_replies))
+
+        if valid_replies:
+            validate_message_reply_consistency(
+                replies=[msg.content for msg in valid_replies],
+                weighted_by_key=self.weighted_by_key,
+                check_arrayrecord=is_train,
+            )
+
+        return valid_replies, error_replies
+
+    # -------------------------------------------------------------------------
+    # 双向蒸馏：初始化/数据准备
+    # -------------------------------------------------------------------------
+
+    def _kd_device(self) -> torch.device:
+        if self._kd_device_pref is None:
+            return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        pref = str(self._kd_device_pref).strip().lower()
+        if pref.startswith("cuda") and torch.cuda.is_available():
+            return torch.device("cuda:0")
+        return torch.device("cpu")
+
+    def _kd_read_overrides(self, cfg: ConfigRecord) -> None:
+        """允许从 ConfigRecord 覆盖（便于从 pyproject/server 动态配置）"""
+        self._kd_enable = _cfg_bool(cfg, "kd-enable", self._kd_enable)
+        self._kd_alpha = _cfg_float(cfg, "kd-alpha", self._kd_alpha)
+        self._kd_temperature = _cfg_float(cfg, "kd-temperature", self._kd_temperature)
+        self._kd_cal_samples = _cfg_int(cfg, "kd-cal-samples", self._kd_cal_samples)
+        self._kd_global_samples = _cfg_int(cfg, "kd-global-samples", self._kd_global_samples)
+        self._kd_batch_size = _cfg_int(cfg, "kd-batch-size", self._kd_batch_size)
+        self._kd_forward_epochs = _cfg_int(cfg, "kd-forward-epochs", self._kd_forward_epochs)
+        self._kd_forward_lr = _cfg_float(cfg, "kd-forward-lr", self._kd_forward_lr)
+        self._kd_reverse_epochs = _cfg_int(cfg, "kd-reverse-epochs", self._kd_reverse_epochs)
+        self._kd_reverse_lr = _cfg_float(cfg, "kd-reverse-lr", self._kd_reverse_lr)
+
+    def _ensure_kd_objects(self) -> None:
+        """延迟初始化 teacher 与 D_cal/D_global"""
+        if not self._kd_enable:
+            return
+
+        # 如果没有传入热启动的 teacher，则回退到重新初始化 BigTeacherNet
+        if self.teacher_model is None:
+            self.teacher_model = BigTeacherNet()
+
+        if self._dcal_loader is None:
+            self._dcal_loader = build_dcal_loader(
+                num_samples=self._kd_cal_samples,
+                batch_size=self._kd_batch_size,
+                split=self._kd_cal_split,
+            )
+
+        if self._dglobal_loader is None:
+            self._dglobal_loader = build_dglobal_loader(
+                num_samples=self._kd_global_samples,
+                batch_size=self._kd_batch_size,
+                split=self._kd_global_split,
+            )
+
+    # -------------------------------------------------------------------------
+    # Strategy override
+    # -------------------------------------------------------------------------
+
+    def configure_train(self, server_round: int, arrays: ArrayRecord, config: ConfigRecord, grid: Grid) -> Iterable[Message]:
+        if self.fraction_train == 0.0:
+            return []
+
+        self._kd_read_overrides(config)
+
+        # ============================================================
+        # Ground→Satellite 正向蒸馏：teacher -> student（下发前）
+        # ============================================================
+        arrays_to_send = arrays
+        if self._kd_enable:
+            try:
+                self._ensure_kd_objects()
+                device = self._kd_device()
+
+                student = Net()
+                student.load_state_dict(arrays.to_torch_state_dict())
+
+                fwd_loss = distill_teacher_to_student(
+                    teacher=self.teacher_model,  # type: ignore[arg-type]
+                    student=student,
+                    loader=self._dcal_loader,    # type: ignore[arg-type]
+                    device=device,
+                    alpha=self._kd_alpha,
+                    temperature=self._kd_temperature,
+                    lr=self._kd_forward_lr,
+                    epochs=self._kd_forward_epochs,
+                )
+
+                arrays_to_send = ArrayRecord(student.state_dict())
+                self._last_kd_forward_round = server_round
+                self._last_kd_forward_loss = float(fwd_loss)
+
+                log(INFO, "KD Forward (round=%s): loss=%.6f (alpha=%.3f, T=%.2f, epochs=%d)",
+                    server_round, fwd_loss, self._kd_alpha, self._kd_temperature, self._kd_forward_epochs)
+
+            except Exception as e:
+                log(WARNING, "KD Forward failed, fallback to raw arrays. err=%s", str(e))
+                arrays_to_send = arrays
+
+        # ============================================================
+        # 节点选择与分发
+        # ============================================================
+        all_nodes = self._wait_for_nodes(grid, self.min_available_nodes)
+
+        self._connected_history.append(set(all_nodes))
+        if len(self._connected_history) > self.turnover_T:
+            self._connected_history = self._connected_history[-self.turnover_T:]
+
+        if self.selection_mode == "window" and self.ks_train is not None:
+            sample_size = max(int(self.ks_train), self.min_train_nodes)
         else:
-            log(INFO, "🔵 NOW RUNNING MODE: %s (WITH WARM START)", client_train_mode.upper())
-        log(INFO, "*"*60)
+            num_nodes = int(len(all_nodes) * self.fraction_train)
+            sample_size = max(num_nodes, self.min_train_nodes)
 
-        # 所有模式均使用地面蒸馏后的 student 作为热启动初始参数
-        global_model = copy.deepcopy(distilled_student)
-        arrays = ArrayRecord(global_model.state_dict())
+        candidates, probe, _ = self._filter_and_probe(all_nodes, sample_size)
 
-        # ---- 按模式分别构建 strategy / train_cfg / evaluate_fn ----
-        if client_train_mode == "fedavg":
-            # FedAvg baseline：复用 FedMeta 策略，关闭双向 KD
-            strategy = FedMeta(
-                fraction_evaluate=fraction_evaluate,
-                selection_mode=selection_mode,
-                ks_train=int(ks_train) if ks_train is not None else None,
-                ks_evaluate=int(ks_eval) if ks_eval is not None else None,
-                enforce_comm=enforce_comm,
-                turnover_T=turnover_T, deltaQ=deltaQ, deltaP=deltaP,
-                probe_blocked_k=probe_blocked_k,
-                kd_enable=False,        # FedAvg 不使用双向 KD
-                initial_teacher_model=None,
-            )
-            train_cfg = ConfigRecord({
-                **comm_defaults,
-                "client-train-mode": "fedavg",
-                "learning-rate":           float(cfg.get("learning-rate",           0.01)),
-                "fedavg-local-epochs":     int(  cfg.get("fedavg-local-epochs",     1)),
-                "fedavg-weight-decay":     float(cfg.get("fedavg-weight-decay",     1e-4)),
-                "fedavg-label-smoothing":  float(cfg.get("fedavg-label-smoothing",  0.1)),
-                "batch-size": batch_size,
-                "dirichlet-alpha": dirichlet_alpha,
-                "kd-enable": False,
-            })
-            # FedAvg 统一使用 meta_eval_config，与 FedMeta 系列评估标准完全一致
-            eval_cfg = ConfigRecord({**comm_defaults, **meta_eval_config})
-            # 评估改为客户端本地 Non-IID 数据聚合，服务器端不再跑全局 IID 测试集
-            evaluate_fn = make_global_evaluate_from_clients(
-                meta_adapt_steps=meta_adapt_steps, meta_adapt_lr=meta_adapt_lr
-            )
-
+        if self.selection_mode == "window":
+            node_ids = self._select_by_window(candidates, sample_size)
         else:
-            # FedMeta 系列三种模式：保持原有完整配置不变
-            strategy = FedMeta(
-                fraction_evaluate=fraction_evaluate,
-                selection_mode=selection_mode,
-                ks_train=int(ks_train) if ks_train is not None else None,
-                ks_evaluate=int(ks_eval) if ks_eval is not None else None,
-                enforce_comm=enforce_comm,
-                turnover_T=turnover_T, deltaQ=deltaQ, deltaP=deltaP,
-                probe_blocked_k=probe_blocked_k,
-                kd_enable=kd_enable, kd_alpha=kd_alpha, kd_temperature=kd_temperature,
-                kd_cal_samples=kd_cal_samples, kd_global_samples=kd_global_samples,
-                kd_batch_size=kd_batch_size,
-                kd_forward_epochs=kd_forward_epochs, kd_forward_lr=kd_forward_lr,
-                kd_reverse_epochs=kd_reverse_epochs, kd_reverse_lr=kd_reverse_lr,
-                initial_teacher_model=copy.deepcopy(distilled_teacher),
+            pool = candidates[:]
+            random.shuffle(pool)
+            node_ids = pool[:sample_size]
+
+        for nid in probe:
+            if nid not in node_ids:
+                node_ids.append(nid)
+
+        log(INFO, "configure_train: Selected %s nodes (online=%s, mode=%s, blocked=%s, probe=%s)",
+            len(node_ids), len(all_nodes), self.selection_mode, len(self._blocked), len(probe))
+
+        config["server-round"] = server_round
+
+        # v5 Mixed 模式改为用全局 student 模型（arrays）作为 APSKD snapshot
+        # 不再需要下发 BigTeacherNet，减少通信开销
+        train_mode = str(_cfg_get(config, "client-train-mode", "fomaml")).strip().lower()
+        record_dict: dict = {self.arrayrecord_key: arrays_to_send, self.configrecord_key: config}
+
+        record = RecordDict(record_dict)
+        return self._construct_messages(record, node_ids, MessageType.TRAIN)
+
+    def aggregate_train(self, server_round: int, replies: Iterable[Message]) -> tuple[ArrayRecord | None, MetricRecord | None]:
+        # 1) 检查回复并更新链路状态
+        valid_replies, _ = self._check_and_log_replies(replies, is_train=True)
+        if valid_replies:
+            self._update_link_state_from_replies(valid_replies)
+
+        # 2) 聚合客户端更新
+        arrays_out: ArrayRecord | None = None
+        metrics_out: MetricRecord | None = None
+
+        if valid_replies:
+            reply_contents = [msg.content for msg in valid_replies]
+            arrays_out = aggregate_arrayrecords(reply_contents, self.weighted_by_key)
+            metrics_out = self.train_metrics_aggr_fn(reply_contents, self.weighted_by_key)
+
+        if arrays_out is None:
+            return None, None
+
+        # 3) BN 统计量校准：聚合平均后 running_mean/var 失效，用 D_cal 重新估计
+        #    MobileNetV2 有 27 个 BN 层，不校准会导致精度大幅下滑
+        try:
+            self._ensure_kd_objects()   # 确保 _dcal_loader 已初始化
+            device = self._kd_device()
+            student_for_bn = Net()
+            student_for_bn.load_state_dict(arrays_out.to_torch_state_dict())
+            student_for_bn = calibrate_bn_stats(
+                student_for_bn,
+                loader=self._dcal_loader,
+                device=device,
+                num_batches=20,
             )
-            train_cfg = ConfigRecord({
-                **comm_defaults,
-                **fomaml_config,
-                "client-train-mode": client_train_mode,
-                "apskd-epochs": apskd_epochs,
-                "apskd-lr": apskd_lr,
-                "kd-temperature": kd_temperature,
-                "kd-alpha": kd_alpha,
-                "kd-enable": kd_enable,
-                "kd-warmup-rounds": kd_warmup_rounds,
-            })
-            eval_cfg = ConfigRecord({**comm_defaults, **meta_eval_config})
-            # 评估改为客户端本地 Non-IID 数据聚合
-            evaluate_fn = make_global_evaluate_from_clients(
-                meta_adapt_steps=meta_adapt_steps, meta_adapt_lr=meta_adapt_lr
-            )
+            arrays_out = ArrayRecord(student_for_bn.state_dict())
+            log(INFO, "BN Calibration done (round=%s)", server_round)
+        except Exception as e:
+            log(WARNING, "BN Calibration failed, using raw aggregated stats. err=%s", str(e))
 
-        result = strategy.start(
-            grid=grid,
-            initial_arrays=arrays,
-            train_config=train_cfg,
-            evaluate_config=eval_cfg,
-            num_rounds=num_rounds,
-            evaluate_fn=evaluate_fn,
-        )
+        # 4) Student→Teacher 反向蒸馏：用聚合 student 更新 teacher
+        if self._kd_enable:
+            try:
+                self._ensure_kd_objects()
+                device = self._kd_device()
 
-        torch.save(result.arrays.to_torch_state_dict(), f"final_model_{client_train_mode}.pt")
+                student_aggr = Net()
+                student_aggr.load_state_dict(arrays_out.to_torch_state_dict())
 
-        if client_train_mode != "fedavg" and kd_enable:
-            teacher = getattr(strategy, "teacher_model", None)
-            if teacher is not None:
-                try:
-                    torch.save(teacher.state_dict(), f"teacher_model_{client_train_mode}.pt")
-                except Exception as e:
-                    log(WARNING, "Failed to save teacher model: %s", str(e))
+                rev_loss = reverse_distill_student_to_teacher(
+                    teacher=self.teacher_model,   # type: ignore[arg-type]
+                    student=student_aggr,
+                    loader=self._dglobal_loader,  # type: ignore[arg-type]
+                    device=device,
+                    alpha=self._kd_alpha,
+                    temperature=self._kd_temperature,
+                    lr=self._kd_reverse_lr,
+                    epochs=self._kd_reverse_epochs,
+                )
 
-        plot_filename = f"training_metrics_{client_train_mode}.png"
-        plot_metrics(result, filename=plot_filename)
+                if metrics_out is None:
+                    metrics_out = MetricRecord({})
+                metrics_out["kd_reverse_loss"] = float(rev_loss)
 
-        # 评估结果来源：
-        #   history_eval_client = 客户端 evaluate() 回传的本地 Non-IID 评估聚合
-        #                         （eval_acc / eval_loss 字段）
-        #   history_train       = 客户端 train() 回传的训练指标（train_loss 字段）
-        history_eval_client = getattr(result, "evaluate_metrics_clientapp", None)
-        history_train = getattr(result, "train_metrics_clientapp", None)
+                if self._last_kd_forward_round == server_round and self._last_kd_forward_loss is not None:
+                    metrics_out["kd_forward_loss"] = float(self._last_kd_forward_loss)
 
-        if history_eval_client:
-            metrics_to_save = {}
-            all_rounds = set(history_eval_client.keys())
-            if history_train:
-                all_rounds |= set(history_train.keys())
-            for r in sorted(all_rounds):
-                m_eval  = history_eval_client.get(r, {}) if history_eval_client else {}
-                m_train = history_train.get(r, {})       if history_train       else {}
-                metrics_to_save[int(r)] = {
-                    "accuracy":   float(m_eval["eval_acc"])    if "eval_acc"   in m_eval  else None,
-                    "loss":       float(m_eval["eval_loss"])   if "eval_loss"  in m_eval  else None,
-                    "train_loss": float(m_train["train_loss"]) if "train_loss" in m_train else None,
-                }
-            json_filename = f"metrics_{client_train_mode}.json"
-            with open(json_filename, "w") as f:
-                json.dump(metrics_to_save, f)
-            log(INFO, f"Metrics successfully saved to {json_filename}.")
+                metrics_out["kd_alpha"] = float(self._kd_alpha)
+                metrics_out["kd_temperature"] = float(self._kd_temperature)
+
+                log(INFO, "KD Reverse (round=%s): loss=%.6f (epochs=%d)",
+                    server_round, rev_loss, self._kd_reverse_epochs)
+
+            except Exception as e:
+                log(WARNING, "KD Reverse failed (teacher not updated). err=%s", str(e))
+
+        return arrays_out, metrics_out
+
+    def configure_evaluate(self, server_round: int, arrays: ArrayRecord, config: ConfigRecord, grid: Grid) -> Iterable[Message]:
+        if self.fraction_evaluate == 0.0:
+            return []
+
+        all_nodes = self._wait_for_nodes(grid, self.min_available_nodes)
+
+        if self.selection_mode == "window" and self.ks_evaluate is not None:
+            sample_size = max(int(self.ks_evaluate), self.min_evaluate_nodes)
         else:
-            log(WARNING, "No client-side evaluate metrics found for mode: %s", client_train_mode)
+            num_nodes = int(len(all_nodes) * self.fraction_evaluate)
+            sample_size = max(num_nodes, self.min_evaluate_nodes)
 
-    # ============================================================
-    # 全部循环结束后，绘制对比图
-    # ============================================================
-    log(INFO, "\n" + "="*60)
-    log(INFO, "🎉 ALL EXPERIMENTS COMPLETED! Generating final comparison plots...")
-    log(INFO, "="*60)
+        candidates, probe, _ = self._filter_and_probe(all_nodes, sample_size)
 
-    plot_multi_mode_comparison()
-    plot_train_loss_comparison()
+        if self.selection_mode == "window":
+            node_ids = self._select_by_window(candidates, sample_size)
+        else:
+            pool = candidates[:]
+            random.shuffle(pool)
+            node_ids = pool[:sample_size]
+
+        for nid in probe:
+            if nid not in node_ids:
+                node_ids.append(nid)
+
+        log(INFO, "configure_evaluate: Selected %s nodes", len(node_ids))
+
+        config["server-round"] = server_round
+        record = RecordDict({self.arrayrecord_key: arrays, self.configrecord_key: config})
+        return self._construct_messages(record, node_ids, MessageType.EVALUATE)
+
+    def aggregate_evaluate(self, server_round: int, replies: Iterable[Message]) -> MetricRecord | None:
+        valid_replies, _ = self._check_and_log_replies(replies, is_train=False)
+        if valid_replies:
+            self._update_link_state_from_replies(valid_replies)
+
+        metrics = None
+        if valid_replies:
+            reply_contents = [msg.content for msg in valid_replies]
+            metrics = self.evaluate_metrics_aggr_fn(reply_contents, self.weighted_by_key)
+
+        return metrics
