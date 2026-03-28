@@ -29,7 +29,7 @@ clientapp = "fedml.client:app"
 # ============================================================
 # 1. FL 基础训练配置
 # ============================================================
-num-server-rounds = 100
+num-server-rounds = 50
 fraction-evaluate = 1.0
 batch-size = 32
 

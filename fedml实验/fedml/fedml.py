@@ -212,6 +212,9 @@ class FedMeta(Strategy):
         self._last_kd_forward_round: Optional[int] = None
         self._last_kd_forward_loss: Optional[float] = None
 
+        # SCAFFOLD 全局控制变量（服务端维护，每轮用客户端 delta_c 均值更新）
+        self._scaffold_c_global: list = []   # List[Tensor]
+
     # -------------------------------------------------------------------------
     # 基础工具
     # -------------------------------------------------------------------------
@@ -393,6 +396,30 @@ class FedMeta(Strategy):
                 split=self._kd_global_split,
             )
 
+    def _ensure_bn_cal_loader(self) -> None:
+        """
+        确保 BN 校准专用的 D_cal loader 已初始化。
+
+        与 kd_enable 完全无关，所有 FL 方法（FedAvg/FedProx/SCAFFOLD/FedKD/
+        FedMeta/Ours）聚合后都需要对 MobileNetV2 的 27 个 BN 层做统计量校准。
+
+        使用独立的固定参数，不依赖任何 KD 配置：
+          - num_samples=2048：足够让 BN 累积稳定统计量（约 8 个 batch）
+          - batch_size=256：  与 task.py 中 build_dcal_loader 默认值一致
+          - split="train"：   从训练集抽取，与 KD 的 D_cal 共用数据源
+        """
+        if self._dcal_loader is None:
+            try:
+                self._dcal_loader = build_dcal_loader(
+                    num_samples=4096,  # 从 2048 提升到 4096，覆盖更多类别分布
+                    batch_size=256,
+                    split="train",
+                )
+                log(INFO, "BN cal loader initialized (4096 samples, batch=256)")
+            except Exception as e:
+                log(WARNING, "Failed to build BN cal loader: %s", str(e))
+                self._dcal_loader = None
+
     # -------------------------------------------------------------------------
     # Strategy override
     # -------------------------------------------------------------------------
@@ -470,10 +497,27 @@ class FedMeta(Strategy):
 
         config["server-round"] = server_round
 
-        # v5 Mixed 模式改为用全局 student 模型（arrays）作为 APSKD snapshot
-        # 不再需要下发 BigTeacherNet，减少通信开销
+        # FedKD 模式：将教师模型参数附加到下发消息中
+        # 原代码从未写入 teacher_arrays，导致 FedKD 退化为纯 CE 训练
         train_mode = str(_cfg_get(config, "client-train-mode", "fomaml")).strip().lower()
         record_dict: dict = {self.arrayrecord_key: arrays_to_send, self.configrecord_key: config}
+
+        if train_mode == "fedkd" and self._kd_enable and self.teacher_model is not None:
+            try:
+                record_dict["teacher_arrays"] = ArrayRecord(self.teacher_model.state_dict())
+                log(INFO, "FedKD: teacher_arrays attached to train message (round=%s)", server_round)
+            except Exception as e:
+                log(WARNING, "FedKD: failed to attach teacher_arrays: %s", str(e))
+
+        # SCAFFOLD：将服务端维护的 c_global 序列化下发，替代 server.py 的空字符串
+        if train_mode == "scaffold" and self._scaffold_c_global:
+            try:
+                c_global_str = ",".join(f"{v:.8f}" for v in self._scaffold_c_global)
+                config["scaffold-c-global"] = c_global_str
+                log(INFO, "SCAFFOLD: c_global injected into config (len=%d, round=%s)",
+                    len(self._scaffold_c_global), server_round)
+            except Exception as e:
+                log(WARNING, "SCAFFOLD: failed to inject c_global: %s", str(e))
 
         record = RecordDict(record_dict)
         return self._construct_messages(record, node_ids, MessageType.TRAIN)
@@ -496,23 +540,63 @@ class FedMeta(Strategy):
         if arrays_out is None:
             return None, None
 
+        # 2.5) SCAFFOLD 全局控制变量更新（Option I 服务端估算版）
+        # 原方案通过 MetricRecord 传 274K floats，list 长度不一致触发 strict=True 崩溃
+        # 新方案：服务端用「聚合前全局模型 - 聚合后全局模型」差值估算梯度方向
+        # 等价于 c_global ← avg(∇f_k(w))，是 SCAFFOLD 论文 Option I 的近似
+        if valid_replies and hasattr(self, '_scaffold_prev_arrays'):
+            try:
+                device = self._kd_device()
+                prev_model = Net()
+                prev_model.load_state_dict(self._scaffold_prev_arrays.to_torch_state_dict())
+                curr_model = Net()
+                curr_model.load_state_dict(arrays_out.to_torch_state_dict())
+
+                # c_global_new = c_global + (w_prev - w_curr) / lr_estimate
+                # lr_estimate ≈ scaffold-lr（用固定值 0.01）
+                lr_est = 0.01
+                new_c_global = []
+                for p_prev, p_curr in zip(prev_model.parameters(), curr_model.parameters()):
+                    grad_est = (p_prev.detach() - p_curr.detach()) / lr_est
+                    if not self._scaffold_c_global:
+                        new_c_global.append(grad_est.cpu().float().numpy().tolist())
+                    else:
+                        new_c_global.append(grad_est.cpu().float().numpy().tolist())
+                self._scaffold_c_global_tensors = new_c_global
+                # 序列化为扁平 float list 供下发
+                flat = []
+                for g in new_c_global:
+                    flat.extend(g)
+                self._scaffold_c_global = flat
+                log(INFO, "SCAFFOLD: c_global updated via model diff (len=%d, round=%s)",
+                    len(flat), server_round)
+            except Exception as e:
+                log(WARNING, "SCAFFOLD: c_global update failed: %s", str(e))
+
+        # 记录本轮聚合前的模型供下轮差值计算
+        self._scaffold_prev_arrays = arrays_out
+
         # 3) BN 统计量校准：聚合平均后 running_mean/var 失效，用 D_cal 重新估计
         #    MobileNetV2 有 27 个 BN 层，不校准会导致精度大幅下滑
-        try:
-            self._ensure_kd_objects()   # 确保 _dcal_loader 已初始化
-            device = self._kd_device()
-            student_for_bn = Net()
-            student_for_bn.load_state_dict(arrays_out.to_torch_state_dict())
-            student_for_bn = calibrate_bn_stats(
-                student_for_bn,
-                loader=self._dcal_loader,
-                device=device,
-                num_batches=20,
-            )
-            arrays_out = ArrayRecord(student_for_bn.state_dict())
-            log(INFO, "BN Calibration done (round=%s)", server_round)
-        except Exception as e:
-            log(WARNING, "BN Calibration failed, using raw aggregated stats. err=%s", str(e))
+        #    所有方法（含 FedAvg）都需要校准，与 kd_enable 无关
+        self._ensure_bn_cal_loader()   # 独立初始化，不依赖 kd_enable
+        if self._dcal_loader is not None:
+            try:
+                device = self._kd_device()
+                student_for_bn = Net()
+                student_for_bn.load_state_dict(arrays_out.to_torch_state_dict())
+                student_for_bn = calibrate_bn_stats(
+                    student_for_bn,
+                    loader=self._dcal_loader,
+                    device=device,
+                    num_batches=40,  # 从 20 提升到 40，约 10240 样本，BN 统计更稳定
+                )
+                arrays_out = ArrayRecord(student_for_bn.state_dict())
+                log(INFO, "BN Calibration done (round=%s)", server_round)
+            except Exception as e:
+                log(WARNING, "BN Calibration failed, using raw aggregated stats. err=%s", str(e))
+        else:
+            log(WARNING, "BN Calibration skipped: D_cal loader unavailable (round=%s)", server_round)
 
         # 4) Student→Teacher 反向蒸馏：用聚合 student 更新 teacher
         if self._kd_enable:

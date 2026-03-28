@@ -249,18 +249,23 @@ def train(msg: Message, context: Context) -> Message:
         else:
             c_global = None
 
+        c_local_prev = _SCAFFOLD_C_LOCAL.get(partition_id)
         train_loss, delta_c = train_scaffold_fn(
             model, trainloader, device,
             lr           = float(_get(cfg, "learning-rate", 0.01)),
             epochs       = int(  _get(cfg, "local-epochs",  1)),
             c_global     = c_global,
-            c_local      = _SCAFFOLD_C_LOCAL.get(partition_id),
+            c_local      = c_local_prev,
             weight_decay = float(_get(cfg, "weight-decay",  1e-4)),
         )
-        # 保存更新后的本地控制变量（进程级缓存，跨轮次保持）
+        # 修复：正确用 delta_c 累加更新本地控制变量，原代码读旧值存旧值完全无效
         if delta_c is not None:
-            c_local_new = _SCAFFOLD_C_LOCAL.get(partition_id)
-            _SCAFFOLD_C_LOCAL[partition_id] = c_local_new
+            if c_local_prev is None:
+                _SCAFFOLD_C_LOCAL[partition_id] = delta_c
+            else:
+                _SCAFFOLD_C_LOCAL[partition_id] = [
+                    ci + dci for ci, dci in zip(c_local_prev, delta_c)
+                ]
 
     elif train_mode == "fedkd":
         # FedKD (Wu et al., 2022)：server 下发教师软标签监督客户端学生
@@ -278,12 +283,13 @@ def train(msg: Message, context: Context) -> Message:
 
         train_loss = train_fedkd_fn(
             model, trainloader, device,
-            lr              = float(_get(cfg, "learning-rate",  0.005)),
-            epochs          = int(  _get(cfg, "local-epochs",   1)),
+            lr              = float(_get(cfg, "learning-rate",   0.005)),
+            epochs          = int(  _get(cfg, "local-epochs",    1)),
             teacher_model   = teacher_model,
-            kd_temperature  = float(_get(cfg, "kd-temperature", 4.0)),
-            kd_alpha        = float(_get(cfg, "kd-alpha",       0.5)),
-            weight_decay    = float(_get(cfg, "weight-decay",   1e-4)),
+            kd_temperature  = float(_get(cfg, "kd-temperature",  4.0)),
+            kd_alpha        = float(_get(cfg, "kd-alpha",        0.5)),
+            weight_decay    = float(_get(cfg, "weight-decay",    1e-4)),
+            label_smoothing = float(_get(cfg, "label-smoothing", 0.1)),
         )
 
     elif train_mode in ("fedmeta", "fomaml"):
@@ -311,6 +317,7 @@ def train(msg: Message, context: Context) -> Message:
             current_round  = int(  _get(cfg, "server-round",       1)),
             warmup_rounds  = int(  _get(cfg, "kd-warmup-rounds",   20)),
             teacher_model  = prev_global_model,
+            apskd_max_steps= int(  _get(cfg, "apskd-max-steps",    3)),
         )
 
     else:
@@ -376,6 +383,9 @@ def train(msg: Message, context: Context) -> Message:
         int(comm_metrics["comm_ok"]),
         comm_metrics["window_margin_s"],
     )
+
+    # SCAFFOLD delta_c 不再通过 MetricRecord 传递（274K floats 导致聚合时 list 长度不一致崩溃）
+    # 服务端改用聚合前后的模型差值估算 c_global，无需客户端上报
 
     # ---- Step 6: 回传 ----
     train_mode_id = {

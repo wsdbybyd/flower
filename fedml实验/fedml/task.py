@@ -203,20 +203,12 @@ def load_data(partition_id: int, num_partitions: int, batch_size: int, alpha: fl
     """
     Client 端加载本地分区数据（Dirichlet Non-IID）。
 
-    性能优化：
-      num_workers=2：客户端在 Flower 模拟器中以独立进程运行，
-        每个进程分配 2 个 worker 做数据预取，消除 GPU 等待 IO 的空转。
-        注意不设 persistent_workers，避免多进程模拟时 fork 冲突。
-
-      pin_memory=True：锁页内存 → DMA 直传 GPU，减少 CPU→GPU 拷贝延迟。
-
-      prefetch_factor=2：每个 worker 提前预取 2 个 batch，
-        确保 GPU 训练时下一批数据已在内存就绪。
+    重要修复：num_workers=0
+      在 Flower 仿真环境中，Ray 后端已在管理多进程。
+      DataLoader 的多进程 worker 会与 Ray 的进程管理冲突，
+      导致 worker 意外退出（RuntimeError: DataLoader worker exited unexpectedly）。
+      设置 num_workers=0 强制单进程加载，避免冲突。
     """
-    import multiprocessing
-    # 客户端进程内限制 2 个 worker，防止多客户端并发时 worker 数爆炸
-    nw = min(2, multiprocessing.cpu_count())
-
     global fds
     if fds is None:
         partitioner = DirichletPartitioner(
@@ -233,45 +225,37 @@ def load_data(partition_id: int, num_partitions: int, batch_size: int, alpha: fl
     partition_train_test = partition.train_test_split(test_size=0.3, seed=42)
     partition_train_test = partition_train_test.with_transform(apply_transforms)
 
+    # num_workers=0: 禁用多进程，避免与 Ray/Flower 仿真环境冲突
     trainloader = DataLoader(
         partition_train_test["train"], batch_size=batch_size, shuffle=True,
-        num_workers=nw, pin_memory=True,
-        prefetch_factor=2 if nw > 0 else None,
+        num_workers=0, pin_memory=True,
     )
     testloader = DataLoader(
         partition_train_test["test"], batch_size=batch_size, shuffle=False,
-        num_workers=nw, pin_memory=True,
-        prefetch_factor=2 if nw > 0 else None,
+        num_workers=0, pin_memory=True,
     )
     return trainloader, testloader
 
 def load_centralized_dataset_train_test(
     warmup_samples: int = 10000,
     batch_size: int = 256,
-    num_workers: int = 4,
 ):
     """
     Server 端加载数据集（用于地面预训练 / Warm Start）。
 
-    性能优化说明：
+    重要修复：num_workers=0
+      在 Flower 仿真环境中，Ray 后端已在管理多进程。
+      DataLoader 的多进程 worker 会与 Ray 的进程管理冲突。
+      设置 num_workers=0 强制单进程加载，避免冲突。
+
+    性能说明：
       warmup_samples=10000：热启动只需要给 FL 提供一个好的初始化，
         用完整 50000 张反而浪费时间，10000 张子集精度损失 < 2%，速度快 5×。
 
-      batch_size=256：RTX 4060 Laptop (8GB) 显存充裕，
-        ResNet-18(~134MB) + MobileNetV2(~7MB) + 激活值 << 8GB，
-        大 batch 减少调度次数，GPU 利用率从 ~20% 提升到 ~80%。
+      batch_size=256：大 batch 减少调度次数，提高 GPU 利用率。
 
-      num_workers=4：HuggingFace datasets 的 Arrow 格式读取 + PIL 解码 +
-        transform 全在 CPU 完成，num_workers=0（默认）时主线程串行执行，
-        GPU 约 79% 时间在等数据；4 个 worker 并行预取，GPU 空转消除。
-
-      pin_memory=True：将数据预先锁页到内存，.to(device) 时走 DMA 直传，
-        比普通内存到 GPU 的拷贝快约 30%。
+      pin_memory=True：锁页内存 → DMA 直传 GPU，减少 CPU→GPU 拷贝延迟。
     """
-    import multiprocessing
-    # 安全上限：不超过系统 CPU 核心数
-    nw = min(num_workers, multiprocessing.cpu_count())
-
     dataset = load_dataset("uoft-cs/cifar10")
 
     # 训练集：取子集用于热启动
@@ -283,13 +267,14 @@ def load_centralized_dataset_train_test(
     # 测试集：完整 10000 张（评估精度需要）
     test_data = dataset["test"].with_transform(apply_transforms)
 
+    # num_workers=0: 禁用多进程，避免与 Ray/Flower 仿真环境冲突
     trainloader = DataLoader(
         train_data, batch_size=batch_size, shuffle=True,
-        num_workers=nw, pin_memory=True, persistent_workers=(nw > 0),
+        num_workers=0, pin_memory=True,
     )
     testloader = DataLoader(
         test_data, batch_size=batch_size, shuffle=False,
-        num_workers=nw, pin_memory=True, persistent_workers=(nw > 0),
+        num_workers=0, pin_memory=True,
     )
     return trainloader, testloader
 
@@ -300,40 +285,34 @@ def test_centralized_dataset():
 
 def build_dcal_loader(
     *, num_samples: int = 2048, batch_size: int = 256,
-    seed: int = 42, split: str = "train", num_workers: int = 4,
+    seed: int = 42, split: str = "train",
 ) -> DataLoader:
     """
     构造校准集 D_cal（用于每轮下发前正向蒸馏）。
 
-    batch_size=256, num_workers=4, pin_memory=True：
-      与 load_centralized_dataset_train_test 同理，消除数据 IO 瓶颈。
-      D_cal 只有 2048 张，大 batch 让整个 loader 只需 8 步即可跑完 1 epoch。
+    num_workers=0: 禁用多进程，避免与 Ray/Flower 仿真环境冲突。
     """
-    import multiprocessing
-    nw = min(num_workers, multiprocessing.cpu_count())
     ds = load_dataset("uoft-cs/cifar10", split=split)
     ds = ds.shuffle(seed=seed).select(range(num_samples)).with_transform(apply_transforms)
     return DataLoader(
         ds, batch_size=batch_size, shuffle=True,
-        num_workers=nw, pin_memory=True, persistent_workers=(nw > 0),
+        num_workers=0, pin_memory=True,
     )
 
 def build_dglobal_loader(
     *, num_samples: int = 4096, batch_size: int = 256,
-    seed: int = 123, split: str = "train", num_workers: int = 4,
+    seed: int = 123, split: str = "train",
 ) -> DataLoader:
     """
     构造代表集 D_global（用于聚合后反向蒸馏）。
 
-    batch_size=256, num_workers=4：同上，4096 张只需 16 步跑完 1 epoch。
+    num_workers=0: 禁用多进程，避免与 Ray/Flower 仿真环境冲突。
     """
-    import multiprocessing
-    nw = min(num_workers, multiprocessing.cpu_count())
     ds = load_dataset("uoft-cs/cifar10", split=split)
     ds = ds.shuffle(seed=seed).select(range(num_samples)).with_transform(apply_transforms)
     return DataLoader(
         ds, batch_size=batch_size, shuffle=True,
-        num_workers=nw, pin_memory=True, persistent_workers=(nw > 0),
+        num_workers=0, pin_memory=True,
     )
 
 # -----------------------------------------------------------------------------
@@ -371,13 +350,15 @@ def distill_centralized(student, teacher, trainloader, epochs, lr, device, temp=
     """
     地面站单向初始蒸馏（Teacher → Student）。
 
-    non_blocking=True：同 train_centralized，异步 DMA 传输。
-    student.eval()：关闭 Dropout 让梯度方向稳定（MobileNetV2 无 Dropout，
-      但保留 eval() 是好习惯，确保 BN 使用全局统计量而非 batch 统计量）。
-
-    注意：eval() 不影响梯度计算，optimizer.step() 仍正常更新参数。
+    【BN 关键修复】student 必须用 .train() 模式：
+      MobileNetV2 有 27 个 BN 层，初始化后 running_mean=0 / running_var=1。
+      若用 .eval()，BN 冻结这组错误统计量，所有 batch 的归一化输出严重
+      失真，梯度方向错误，10 epochs 后精度仍停在随机水平（10%）。
+      .train() 让每次前向传播更新 running stats，数个 epoch 后统计量
+      收敛到真实分布，蒸馏才能正常进行。
+    teacher 保持 .eval()：只做推理，无需更新 BN。
     """
-    student.to(device).eval()
+    student.to(device).train()   # ← 修复：train() 让 BN 正常积累统计量
     teacher.to(device).eval()
     criterion_ce = nn.CrossEntropyLoss().to(device)
     criterion_kl = nn.KLDivLoss(reduction="batchmean").to(device)
@@ -551,6 +532,9 @@ def test_meta(net, testloader, device, adaptation_steps=5, adaptation_lr=0.01):
       adaptation 梯度方向正确，少样本适应能力得以正常体现。
     """
     net.to(device)
+    # 固定评估随机种子：消除 DataLoader shuffle 导致的跨轮 adaptation batch 顺序差异
+    # 这是 FedAvg/FedProx/FedKD accuracy 曲线震荡的主要来源之一
+    torch.manual_seed(42)
     meta_model = copy.deepcopy(net).eval()   # eval(): 同时冻结 BN stats 和 Dropout
     optimizer = torch.optim.SGD(meta_model.parameters(), lr=adaptation_lr)
     criterion = nn.CrossEntropyLoss().to(device)
@@ -669,7 +653,8 @@ def train_apskd(model, trainloader, device, *, lr, epochs, temperature):
 
 def train_fomaml_apskd(net, trainloader, device, alpha, beta, num_inner_steps,
                        temperature, epochs=1, teacher_model=None,
-                       current_round=1, warmup_rounds=20):
+                       current_round=1, warmup_rounds=20,
+                       apskd_max_steps=3):
     """
     混合模式 v7: MAML-KD Joint Inner-Loop + Adapted-Teacher APSKD Refinement
 
@@ -717,11 +702,16 @@ def train_fomaml_apskd(net, trainloader, device, alpha, beta, num_inner_steps,
     # ── Stage2 步长：与 outer-loop beta 相同量级 ───────────────────────
     apskd_lr = float(beta)
 
-    # 保存最后一个 adapted temp_model 用于 Stage2（每 epoch 更新）
+    # Stage2 教师：累积所有 temp_model 参数均值，比"最后一个"更稳定
+    # 避免单个偏斜 batch 的 adapted 结果主导 Stage2 的软标签方向
     last_adapted_teacher: Optional[torch.nn.Module] = None
+    _teacher_param_accum: Optional[list] = None
+    _teacher_accum_count: int = 0
 
     for ep in range(epochs):
         iterator = iter(trainloader)
+        _teacher_param_accum = None
+        _teacher_accum_count = 0
 
         # ================================================================
         # Stage 1：MAML-KD 联合 inner-loop
@@ -774,8 +764,22 @@ def train_fomaml_apskd(net, trainloader, device, alpha, beta, num_inner_steps,
             total_outer_loss += float(lt.item())
             steps += 1
 
-            # 保留最后一个 adapted temp_model 作为 Stage2 教师
-            last_adapted_teacher = temp_model.eval()
+            # 修复：累积所有 adapted temp_model 参数做均值，
+            # 比单取最后一个更稳定，消除末尾 batch 偏斜数据的噪声影响
+            with torch.no_grad():
+                params = [p.detach().clone() for p in temp_model.parameters()]
+                if _teacher_param_accum is None:
+                    _teacher_param_accum = params
+                else:
+                    _teacher_param_accum = [a + p for a, p in zip(_teacher_param_accum, params)]
+                _teacher_accum_count += 1
+
+        # 用累积均值构建稳定的 Stage2 教师
+        if _teacher_param_accum is not None and _teacher_accum_count > 0:
+            last_adapted_teacher = copy.deepcopy(net).eval()
+            with torch.no_grad():
+                for p_dst, p_acc in zip(last_adapted_teacher.parameters(), _teacher_param_accum):
+                    p_dst.copy_(p_acc / _teacher_accum_count)
 
         # ================================================================
         # Stage 2：APSKD 精调
@@ -796,9 +800,18 @@ def train_fomaml_apskd(net, trainloader, device, alpha, beta, num_inner_steps,
             except Exception:
                 ce_teacher = 1.0
 
-        apskd_opt = torch.optim.SGD(net.parameters(), lr=apskd_lr)
+        # Stage 2 步数限制：固定 apskd_max_steps 步（默认 3），
+        # 防止大量 APSKD 步覆盖 Stage 1 元梯度方向。
+        # apskd_lr 使用 beta * 0.5，比 outer-loop 更小，确保精调幅度有限。
+        apskd_lr_stage2 = float(beta) * 0.5
+        apskd_opt = torch.optim.SGD(net.parameters(), lr=apskd_lr_stage2)
         net.train()
-        for batch in trainloader:
+        stage2_iter = iter(trainloader)
+        for step_idx in range(int(apskd_max_steps)):
+            try:
+                batch = next(stage2_iter)
+            except StopIteration:
+                break
             x = batch["img"].to(device, non_blocking=True)
             y = batch["label"].to(device, non_blocking=True)
 
@@ -809,7 +822,6 @@ def train_fomaml_apskd(net, trainloader, device, alpha, beta, num_inner_steps,
                 z_teacher = last_adapted_teacher(x)
 
             ce_cur = float(l_ce.detach().item())
-            # 自适应权重：当前损失相对教师损失越高，KD 约束越弱（避免早期 KD 过强）
             w_apskd = ce_cur / (ce_cur + ce_teacher + eps)
 
             l_kd_stage2 = F.kl_div(
@@ -861,7 +873,7 @@ def train_fedavg(net, trainloader, device, lr: float = 0.01, epochs: int = 1,
     return total_loss / steps if steps > 0 else 0.0
 
 # -----------------------------------------------------------------------------
-# 5. 新增对比算法 (FedProx / SCAFFOLD / FedKD)
+# 6. 新增对比算法 (FedProx / SCAFFOLD / FedKD)
 # -----------------------------------------------------------------------------
 
 def train_fedprox(net, trainloader, device, lr: float = 0.01, epochs: int = 1,
@@ -932,8 +944,14 @@ def train_scaffold(net, trainloader, device,
     params_list = list(net.parameters())
     if c_global is None:
         c_global = [torch.zeros_like(p) for p in params_list]
+    else:
+        # 修复：clone 防止训练过程中原地修改污染调用方缓存的引用
+        c_global = [cg.detach().clone().to(device) for cg in c_global]
     if c_local is None:
         c_local = [torch.zeros_like(p) for p in params_list]
+    else:
+        # 修复：clone 防止 ci.copy_() 原地写入调用方的 _SCAFFOLD_C_LOCAL 缓存
+        c_local = [ci.detach().clone().to(device) for ci in c_local]
 
     # 记录训练前参数 w_0
     w0 = [p.detach().clone() for p in params_list]
@@ -977,28 +995,25 @@ def train_fedkd(net, trainloader, device,
                 teacher_model=None,
                 kd_temperature: float = 4.0,
                 kd_alpha: float = 0.5,
-                weight_decay: float = 1e-4):
+                weight_decay: float = 1e-4,
+                label_smoothing: float = 0.1):
     """
     FedKD (Wu et al., 2022) 客户端本地蒸馏训练。
 
-    FedKD 的核心：服务端维护一个（通常更大或更优的）教师模型，
-    在每轮训练时将教师模型的软标签传递给客户端学生模型：
-      L_KD = alpha * CE(student, y) + (1-alpha) * KL(student/T || teacher/T)
-    教师在 server 端用聚合后的全局 student 做反向蒸馏持续更新（同我们方案）。
-
-    与我们方案的区别：
-      - FedKD 无元学习（无 inner/outer loop），直接用软标签监督
-      - 无 APSKD 自适应自蒸馏，教师软标签始终来自 server 端全局教师
-      - 适合通信开销较低、无快速适应需求的场景
-
-    teacher_model: server 下发的全局教师模型（BigTeacherNet），eval 模式
+    【修复说明】
+    1. 加入 label_smoothing=0.1：防止 CE 损失趋近 0 导致过拟合。
+       原始实现中软标签监督会使 CE 迅速下降，train_loss 图中 FedKD 趋近 0
+       正是此症状，泛化极差。label_smoothing 提供一个 loss 下限。
+    2. total_loss 改为记录完整 loss（含 KL 项）：原代码只记录 CE 部分，
+       导致 loss 曲线虚低，无法真实反映训练状态。
     """
     net.to(device).train()
 
     if teacher_model is not None:
         teacher_model.to(device).eval()
 
-    criterion_ce = nn.CrossEntropyLoss().to(device)
+    # label_smoothing 防止 CE 过度压缩至 0
+    criterion_ce = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing)).to(device)
     optimizer = torch.optim.SGD(
         net.parameters(), lr=float(lr), momentum=0.9, weight_decay=float(weight_decay)
     )
@@ -1029,7 +1044,8 @@ def train_fedkd(net, trainloader, device,
 
             loss.backward()
             optimizer.step()
-            total_loss += float(loss_ce.item())
+            # 修复：记录完整 loss（含 KL），与实际优化目标一致
+            total_loss += float(loss.item())
             steps += 1
 
     return total_loss / steps if steps > 0 else 0.0
